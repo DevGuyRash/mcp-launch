@@ -1,6 +1,7 @@
+
 // Copyright
 // SPDX-License-Identifier: MIT
-// mcp-launch: minimal supervisor for mcpo + merged OpenAPI + Cloudflare tunnel
+// mcp-launch: minimal supervisor for mcpo + merged OpenAPI + Cloudflare tunnel + TUI preflight
 package main
 
 import (
@@ -27,9 +28,13 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	cfg "mcp-launch/internal/config"
+	"mcp-launch/internal/mcpclient"
+	appTUI "mcp-launch/internal/tui"
 )
 
-const Version = "0.4.2"
+const Version = "0.5.0-tui"
 
 const (
 	defaultFrontPort = 8000
@@ -37,21 +42,13 @@ const (
 	stateDirName     = ".mcp-launch"
 	stateFileName    = "state.json"
 	defaultConfig    = "mcp.config.json"
+	descLimit        = 300
 )
 
 // ---------- config models ----------
 
-type MCPServer struct {
-	Command string            `json:"command,omitempty"`
-	Args    []string          `json:"args,omitempty"`
-	Type    string            `json:"type,omitempty"` // sse | streamable-http
-	URL     string            `json:"url,omitempty"`  // for sse/streamable-http
-	Headers map[string]string `json:"headers,omitempty"`
-}
-
-type MCPConfig struct {
-	MCPServers map[string]MCPServer `json:"mcpServers"`
-}
+type MCPServer = cfg.MCPServer
+type MCPConfig = cfg.Config
 
 // ---------- runtime / state ----------
 
@@ -68,6 +65,35 @@ type Instance struct {
 	McpoPID        int      `json:"mcpo_pid"`
 	ToolNames      []string `json:"tool_names"`
 	OperationCount int      `json:"operation_count"` // total OpenAPI operations after merge
+
+	// Per-server diagnostics (computed during preflight or merge).
+	ServerOpCounts       map[string]int      `json:"server_op_counts,omitempty"`
+	ServerLongDescCounts map[string]int      `json:"server_long_desc_counts,omitempty"`
+	ServerWarns          map[string][]string `json:"server_warns,omitempty"` // details (only when -v/-vv)
+}
+
+// Overlay stores filters and description overrides collected via TUI.
+type Overlay struct {
+	Disabled     map[string]bool              `json:"disabled,omitempty"`     // server -> disabled
+	Allow        map[string]map[string]bool   `json:"allow,omitempty"`        // server -> tool -> allowed
+	Deny         map[string]map[string]bool   `json:"deny,omitempty"`         // server -> tool -> denied
+	Descriptions map[string]map[string]string `json:"descriptions,omitempty"` // server -> tool -> <=300 desc
+}
+
+func (o *Overlay) allowed(server, tool string) bool {
+	// If server disabled, nothing is allowed.
+	if o != nil && o.Disabled != nil && o.Disabled[server] {
+		return false
+	}
+	// If allow-list defined: only allowed items pass.
+	if o != nil && o.Allow != nil && o.Allow[server] != nil {
+		return o.Allow[server][tool]
+	}
+	// Otherwise allow by default unless denied.
+	if o != nil && o.Deny != nil && o.Deny[server] != nil && o.Deny[server][tool] {
+		return false
+	}
+	return true
 }
 
 type State struct {
@@ -82,7 +108,6 @@ type State struct {
 	CloudflaredPID int      `json:"cloudflared_pid,omitempty"`
 	McpoPID        int      `json:"mcpo_pid,omitempty"`
 	ToolNames      []string `json:"tool_names,omitempty"`
-
 	// Multi-instance (preferred)
 	Instances []Instance `json:"instances"`
 	StartedAt string     `json:"started_at"`
@@ -127,10 +152,8 @@ func main() {
 func usage() {
 	fmt.Println(`mcp-launch ` + Version + `
 One URL per config for many MCP servers (via mcpo). Serves /openapi.json per stack and proxies everything else to its mcpo.
-
 USAGE
   mcp-launch <command> [options]
-
 COMMANDS
   init         Scaffold mcp.config.json and default state
   up           Start one or more stacks (mcpo + proxy + optional Cloudflare) and generate merged OpenAPI per stack
@@ -141,7 +164,6 @@ COMMANDS
   doctor       Check dependencies (mcpo, cloudflared, plus uvx/npx if referenced in config)
   help         Show help (try: mcp-launch help up)
   version      Print version
-
 NOTES
   • Ctrl-C on 'up' will stop all started stacks: mcpo (+ spawned MCP servers), front proxies, and cloudflared.
   • Default output is minimal; use -v or -vv to stream detailed logs. Use --log-file to tee logs to a file.
@@ -154,13 +176,13 @@ func helpTopic(name string) {
 		fmt.Println(`USAGE
   mcp-launch up [--config PATH ...] [--port N] [--mcpo-port N] [--api-key KEY] [--shared-key]
                  [--tunnel quick|named|none] [--public-url URL ...] [--tunnel-name NAME]
-                 [-v | -vv] [--stream] [--log-file PATH]
-
+                 [--tui] [-v | -vv] [--stream] [--log-file PATH]
 DESCRIPTION
   Starts one or more independent "stacks" (one per --config):
     stack = mcpo(:<mcpo-port+i>) + front proxy(:<port+i>) + optional cloudflared tunnel
   Each stack gets its own merged /openapi.json, URL, and API key (unless --shared-key is used).
-
+  If --tui is provided, a preflight TUI will run to optionally disable servers, allow/deny tools,
+  and trim tool descriptions that exceed 300 characters before launch.
 OPTIONS
   --config PATH          Repeatable. Claude-style config(s). Default: mcp.config.json if omitted.
   --port N               Base front proxy port (default: 8000). Subsequent stacks use N+1, N+2, ...
@@ -170,33 +192,15 @@ OPTIONS
   --tunnel MODE          quick | named | none (default: quick)
   --public-url URL       Repeatable. For named/none, provide one per --config (or one applied to all).
   --tunnel-name NAME     Named tunnel to run (cloudflared tunnel run NAME) for each stack
+  --tui                  Launch interactive TUI preflight before starting servers/tunnels.
   -v                     Verbose INFO logs and stream subprocess output
   -vv                    DEBUG logs (also streams subprocess output)
   --stream               Stream subprocess logs without changing verbosity
   --log-file PATH        Append logs to file (created if missing)
-
-WHY MULTI-CONFIG?
-  OpenAI Custom GPTs currently support ~30 tools per Action. Split your servers into multiple configs,
-  run multiple stacks, and import each /openapi.json in a different GPT/chat.
-
-EXAMPLES
-  # Two stacks via Quick Tunnels (independent URLs + keys):
-  mcp-launch up \
-    --config code.json \
-    --config data.json \
-    --tunnel quick
-
-  # Two named stacks with stable hosts and a single shared API key:
-  mcp-launch up \
-    --config code.json --public-url https://gpt-code.example.com \
-    --config data.json --public-url https://gpt-data.example.com \
-    --tunnel named --tunnel-name my-tunnel \
-    --api-key SECRET --shared-key
 `)
 	case "openapi":
 		fmt.Println(`USAGE
   mcp-launch openapi [--public-url URL ...]
-
 DESCRIPTION
   Rebuild the merged OpenAPI document for each running stack from its per-tool specs,
   and set servers[0].url to the provided --public-url(s) (one per stack or one for all)
@@ -253,6 +257,7 @@ func cmdDoctor() {
 	} else {
 		cfg = readConfig(defaultConfig)
 	}
+
 	checks := []string{"mcpo", "cloudflared"}
 	need := map[string]bool{}
 	for _, s := range cfg.MCPServers {
@@ -263,6 +268,7 @@ func cmdDoctor() {
 	for c := range need {
 		checks = append(checks, c)
 	}
+
 	fmt.Println("Dependency checks:")
 	ok := true
 	for _, bin := range checks {
@@ -309,6 +315,7 @@ func cmdUp() {
 	debug := fs.Bool("vv", false, "Debug logs (DEBUG)")
 	stream := fs.Bool("stream", false, "Stream subprocess logs without changing verbosity")
 	logPath := fs.String("log-file", "", "Append logs to file (created if missing)")
+	useTUI := fs.Bool("tui", false, "Interactive TUI preflight/editor before launching")
 	_ = fs.Parse(os.Args[2:])
 
 	ensureStateDir()
@@ -325,7 +332,6 @@ func cmdUp() {
 	} else if *verbose {
 		verbosity = 1
 	}
-
 	streamProcs := *stream || *verbose || *debug
 
 	// Open log file (optional)
@@ -383,7 +389,89 @@ func cmdUp() {
 		instances = append(instances, inst)
 	}
 
-	// Start stacks one by one
+	// --- PREFLIGHT: inspect servers to gather tool lists & long descriptions ---
+	type preflightResult struct {
+		ByServer map[string][]mcpclient.Tool
+	}
+	pf := preflightResult{ByServer: map[string][]mcpclient.Tool{}}
+
+	for i := range instances {
+		inst := &instances[i]
+		cfg := readConfig(inst.ConfigPath)
+		for name, srv := range cfg.MCPServers {
+			// Discover tools for this server
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			sum, err := mcpclient.InspectServer(ctx, name, srv)
+			cancel()
+			if err != nil && verbosity > 0 {
+				fmt.Printf("[preflight#%s] %s: %v\n", inst.Name, name, err)
+			}
+			if len(sum.Tools) > 0 {
+				pf.ByServer[name] = sum.Tools
+			}
+		}
+		// record server lists into instance diagnostics
+		inst.ServerOpCounts = map[string]int{}
+		inst.ServerLongDescCounts = map[string]int{}
+		for sname, tools := range pf.ByServer {
+			inst.ServerOpCounts[sname] = len(tools)
+			long := 0
+			for _, t := range tools {
+				if len([]rune(t.Description)) > descLimit {
+					long++
+				}
+			}
+			inst.ServerLongDescCounts[sname] = long
+		}
+	}
+
+	// Optional: TUI to edit allow/deny/desc and disable servers.
+	var overlay *Overlay
+	launchMode := "mcpo"
+	if *useTUI {
+		ov, mode, err := appTUI.Run(pf.ByServer)
+		if err != nil {
+			fmt.Println("TUI error:", err)
+		} else {
+			// If user quit with 'q', overlay == nil (cancel); abort.
+			if ov == nil {
+				fmt.Println("Cancelled.")
+				return
+			}
+			overlay = &Overlay{
+				Disabled:     ov.Disabled,
+				Allow:        ov.Allow,
+				Deny:         ov.Deny,
+				Descriptions: ov.Descriptions,
+			}
+			launchMode = mode
+		}
+	}
+
+	// Branch by launch mode
+	if launchMode == "raw" {
+		launchRaw(instances, overlay, streamProcs)
+		return
+	}
+
+	
+	// Launch mode selected via TUI (or default "mcpo").
+	
+	// Clone configs to a temp dir and apply overlay (currently: disabled servers only).
+	for i := range instances {
+		clonePath, err := cloneConfigApplyOverlay(instances[i].ConfigPath, instances[i].Name, overlay)
+		if err == nil && clonePath != "" {
+			instances[i].ConfigPath = clonePath
+		} else if err != nil {
+			fmt.Println("warning: could not clone config:", err)
+		}
+	}
+
+	if *useTUI && launchMode == "raw" {
+		launchRaw(instances, overlay, streamProcs)
+		return
+	}
+// Start stacks one by one
 	type running struct {
 		inst   *Instance
 		proxy  *frontProxy
@@ -391,7 +479,6 @@ func cmdUp() {
 		tunnel *exec.Cmd
 	}
 	runs := make([]*running, 0, len(instances))
-
 	for i := range instances {
 		inst := &instances[i]
 
@@ -413,17 +500,19 @@ func cmdUp() {
 		}
 		inst.McpoPID = mcpoCmd.Process.Pid
 		saveStateMulti(&st, instances)
-
 		tag := "mcpo#" + inst.Name
 		go scanAndMaybeStream(tag, stdout, streamProcs, lf, nil)
 		go scanAndMaybeStream(tag, stderr, streamProcs, lf, nil)
-
 		waitURL(fmt.Sprintf("http://127.0.0.1:%d/docs", inst.McpoPort), 60*time.Second)
 
 		// Record MCP server names from config
 		cfg := readConfig(inst.ConfigPath)
 		var toolNames []string
 		for name := range cfg.MCPServers {
+			// honor disabled
+			if overlay != nil && overlay.Disabled != nil && overlay.Disabled[name] {
+				continue
+			}
 			toolNames = append(toolNames, name)
 		}
 		slices.Sort(toolNames)
@@ -466,17 +555,20 @@ func cmdUp() {
 			}
 		}
 
-		// Merge OpenAPI for this instance
+		// Merge OpenAPI for this instance (apply overlay filters/description overrides)
 		baseURL := inst.PublicURL
 		if baseURL == "" {
 			baseURL = fmt.Sprintf("http://127.0.0.1:%d", inst.FrontPort)
 		}
-		spec, err := mergeOpenAPI(*inst, baseURL)
+		spec, perServerWarns, perServerCounts, err := mergeOpenAPI(*inst, baseURL, overlay)
 		if err != nil {
 			fmt.Printf("[openapi#%s] merge failed: %v\n", inst.Name, err)
 		} else {
 			inst.OperationCount = countOperations(spec)
+			inst.ServerWarns = perServerWarns
+			inst.ServerOpCounts = perServerCounts
 			saveStateMulti(&st, instances)
+
 			// quick sanity check: any dangling component refs?
 			if warns := findDanglingComponentRefs(spec); len(warns) > 0 {
 				fmt.Printf("[openapi#%s] WARNING: unresolved $ref targets detected:\n", inst.Name)
@@ -520,13 +612,56 @@ func cmdUp() {
 		}
 		fmt.Printf("   MCP servers: %d\n", len(inst.ToolNames))
 		fmt.Printf("   Endpoints (OpenAPI operations): %d%s\n", inst.OperationCount, warn)
+		// Per-server tool count + long description warning (summary only)
+		if len(inst.ServerOpCounts) > 0 {
+			names := slices.Sorted(mapsKeys(inst.ServerOpCounts))
+			for _, sname := range names {
+				count := inst.ServerOpCounts[sname]
+				sWarn := ""
+				if count >= 30 {
+					sWarn = "  ⚠ 30+ tools on this server"
+				}
+				long := 0
+				if inst.ServerLongDescCounts != nil {
+					long = inst.ServerLongDescCounts[sname]
+				}
+				longMsg := ""
+				if long > 0 {
+					longMsg = "  ⚠ tool descriptions >300"
+				}
+				fmt.Printf("     - %s: %d tools%s%s\n", sname, count, sWarn, longMsg)
+			}
+			// Detailed listing available via -v / logs
+			if verbosity == 0 {
+				fmt.Printf("     (run with -v to see specific tools exceeding 300-char description limit)\n")
+			}
+		}
 	}
-	fmt.Println()
+	
+	// Detailed description-length warnings (only in verbose modes)
+	if verbosity > 0 {
+		for _, r := range runs {
+			inst := r.inst
+			if len(inst.ServerWarns) == 0 {
+				continue
+			}
+			fmt.Printf("[details#%s] Tools with descriptions > %d chars:\n", inst.Name, descLimit)
+			names := slices.Sorted(mapsKeys(inst.ServerWarns))
+			for _, sname := range names {
+				warns := inst.ServerWarns[sname]
+				if len(warns) == 0 { continue }
+				fmt.Printf("  %s:\n", sname)
+				for _, w := range warns {
+					fmt.Printf("    - %s\n", w)
+				}
+			}
+		}
+		fmt.Println()
+	}
 
 	// Handle signals and mcpo exits
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-
 	doneCh := make(chan string, len(runs))
 	for _, r := range runs {
 		go func(name string, cmd *exec.Cmd) {
@@ -534,11 +669,9 @@ func cmdUp() {
 			doneCh <- name
 		}(r.inst.Name, r.mcpo)
 	}
-
 	if verbosity > 0 {
 		fmt.Println("Press Ctrl+C to stop (or run `mcp-launch down` from another shell).")
 	}
-
 	cleanup := func() {
 		// stop proxies first
 		for _, r := range runs {
@@ -560,7 +693,6 @@ func cmdUp() {
 		}
 		saveStateMulti(&st, instances)
 	}
-
 	select {
 	case <-sigCh:
 		fmt.Println("\nReceived signal, shutting down…")
@@ -592,7 +724,6 @@ func cmdStatus() {
 		}
 		return
 	}
-
 	fmt.Println("mcp-launch status (multi):")
 	for i, inst := range st.Instances {
 		base := inst.PublicURL
@@ -673,6 +804,69 @@ func cmdDown() {
 	saveState(&st)
 }
 
+
+// launchRaw starts MCP servers "normally" (stdio), without mcpo or OpenAPI.
+// It honors the overlay (disabled servers), and streams output. Ctrl-C stops all.
+func launchRaw(instances []Instance, ov *Overlay, streamProcs bool) {
+	fmt.Println("Launching MCP servers in RAW mode (no mcpo / no OpenAPI).")
+	fmt.Println("Press Ctrl+C to stop.")
+	// For simplicity, we launch servers from the first instance's config only.
+	if len(instances) == 0 {
+		fmt.Println("No instances to launch.")
+		return
+	}
+	inst := instances[0]
+	cfg := readConfig(inst.ConfigPath)
+	type run struct{
+		name string
+		cmd *exec.Cmd
+	}
+	var runs []run
+	for name, srv := range cfg.MCPServers {
+		if ov != nil && ov.Disabled != nil && ov.Disabled[name] {
+			continue
+		}
+		if strings.ToLower(srv.Type) == "streamable-http" && srv.URL != "" {
+			fmt.Printf("[raw] Skipping %s: streamable-http target URL=%s (no supervisor)\n", name, srv.URL)
+			continue
+		}
+		if srv.Command == "" {
+			fmt.Printf("[raw] Skipping %s: no command\n", name)
+			continue
+		}
+		cmd := exec.Command(findBinary(srv.Command), srv.Args...)
+		if len(srv.Env) > 0 {
+			env := os.Environ()
+			for k, v := range srv.Env {
+				env = append(env, fmt.Sprintf("%s=%s", k, v))
+			}
+			cmd.Env = env
+		}
+		stdout, _ := cmd.StdoutPipe()
+		stderr, _ := cmd.StderrPipe()
+		if err := cmd.Start(); err != nil {
+			fmt.Printf("[raw] Failed to start %s: %v\n", name, err)
+			continue
+		}
+		tag := "mcp#" + name
+		go scanAndMaybeStream(tag, stdout, streamProcs, nil, nil)
+		go scanAndMaybeStream(tag, stderr, streamProcs, nil, nil)
+		fmt.Printf("[raw] started %s (pid=%d)\n", name, cmd.Process.Pid)
+		runs = append(runs, run{name: name, cmd: cmd})
+	}
+	// Wait for Ctrl+C
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	<-sigCh
+	fmt.Println("\nStopping MCP servers...")
+	for _, r := range runs {
+		_ = r.cmd.Process.Signal(os.Interrupt)
+		time.Sleep(200 * time.Millisecond)
+		_ = r.cmd.Process.Kill()
+	}
+}
+
+
 func cmdOpenAPI() {
 	fs := flag.NewFlagSet("openapi", flag.ExitOnError)
 	fs.Usage = func() { helpTopic("openapi") }
@@ -685,7 +879,6 @@ func cmdOpenAPI() {
 		fmt.Println("No running stacks found in state.")
 		return
 	}
-
 	for i := range st.Instances {
 		inst := &st.Instances[i]
 		baseURL := inst.PublicURL
@@ -697,7 +890,7 @@ func cmdOpenAPI() {
 		if baseURL == "" {
 			baseURL = fmt.Sprintf("http://127.0.0.1:%d", inst.FrontPort)
 		}
-		spec, err := mergeOpenAPI(*inst, baseURL)
+		spec, _, _, err := mergeOpenAPI(*inst, baseURL, nil)
 		if err != nil {
 			fmt.Printf("[openapi#%s] merge failed: %v\n", inst.Name, err)
 			continue
@@ -717,6 +910,34 @@ func cmdOpenAPI() {
 }
 
 // ---------- helpers ----------
+
+
+// cloneConfigApplyOverlay clones the given config JSON into .mcp-launch/tmp/<name>/mcp.config.json
+// and applies overlay changes that can be expressed in the config (currently: disabled servers).
+func cloneConfigApplyOverlay(path, name string, ov *Overlay) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil { return "", err }
+	var in map[string]any
+	if err := json.Unmarshal(data, &in); err != nil { return "", err }
+	ms, ok := in["mcpServers"].(map[string]any)
+	if !ok { return "", fmt.Errorf("no mcpServers object in %s", path) }
+	// Remove disabled servers
+	if ov != nil && ov.Disabled != nil {
+		for srv := range ov.Disabled {
+			if ov.Disabled[srv] {
+				delete(ms, srv)
+			}
+		}
+	}
+	in["mcpServers"] = ms
+	out, _ := json.MarshalIndent(in, "", "  ")
+	dir := filepath.Join(getStateDir(), "tmp", name)
+	_ = os.MkdirAll(dir, 0o755)
+	outPath := filepath.Join(dir, "mcp.config.json")
+	if err := os.WriteFile(outPath, out, 0644); err != nil { return "", err }
+	return outPath, nil
+}
+
 
 func readConfig(path string) MCPConfig {
 	data, err := os.ReadFile(path)
@@ -874,7 +1095,6 @@ func newFrontProxy(frontPort, mcpoPort int) *frontProxy {
 	target, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", mcpoPort))
 	p := httputil.NewSingleHostReverseProxy(target)
 	fp := &frontProxy{proxy: p}
-
 	mux := http.NewServeMux()
 	mux.HandleFunc("/openapi.json", func(w http.ResponseWriter, r *http.Request) {
 		fp.mu.RLock()
@@ -893,7 +1113,6 @@ func newFrontProxy(frontPort, mcpoPort int) *frontProxy {
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		p.ServeHTTP(w, r)
 	})
-
 	fp.srv = &http.Server{
 		Addr:    fmt.Sprintf(":%d", frontPort),
 		Handler: mux,
@@ -942,7 +1161,6 @@ func startQuickTunnel(tag string, frontPort int, stream bool, logFile *os.File) 
 	}
 	go scanAndMaybeStream(tag, stdout, stream, logFile, parse)
 	go scanAndMaybeStream(tag, stderr, stream, logFile, parse)
-
 	select {
 	case u := <-urlCh:
 		return strings.TrimSuffix(u, "/")
@@ -962,7 +1180,6 @@ func startNamedTunnel(tag, name string, stream bool, logFile *os.File) {
 	_ = cmd.Start()
 	go scanAndMaybeStream(tag, stdout, stream, logFile, nil)
 	go scanAndMaybeStream(tag, stderr, stream, logFile, nil)
-
 	// save PID
 	st := loadState()
 	for i := range st.Instances {
@@ -1055,10 +1272,10 @@ func nameFromPath(p string, i int) string {
 
 // -------- OpenAPI merge --------
 
-func mergeOpenAPI(inst Instance, baseURL string) ([]byte, error) {
+func mergeOpenAPI(inst Instance, baseURL string, ov *Overlay) ([]byte, map[string][]string, map[string]int, error) {
 	cfg := readConfig(inst.ConfigPath)
 	if len(cfg.MCPServers) == 0 {
-		return nil, fmt.Errorf("no mcpServers in %s", inst.ConfigPath)
+		return nil, nil, nil, fmt.Errorf("no mcpServers in %s", inst.ConfigPath)
 	}
 
 	merged := map[string]any{
@@ -1088,18 +1305,26 @@ func mergeOpenAPI(inst Instance, baseURL string) ([]byte, error) {
 		},
 		"paths": map[string]any{},
 	}
-
 	pathsOut := merged["paths"].(map[string]any)
 	comp := merged["components"].(map[string]any)
 
 	// iterate tool names deterministically
 	names := make([]string, 0, len(cfg.MCPServers))
 	for name := range cfg.MCPServers {
+		// honor disabled overlay
+		if ov != nil && ov.Disabled != nil && ov.Disabled[name] {
+			continue
+		}
 		names = append(names, name)
 	}
 	slices.Sort(names)
 
 	client := &http.Client{Timeout: 30 * time.Second}
+
+	// per-server warnings and counts
+	perServerWarns := map[string][]string{}
+	perServerCounts := map[string]int{}
+
 	for _, name := range names {
 		toolURL := fmt.Sprintf("http://127.0.0.1:%d/%s/openapi.json", inst.McpoPort, name)
 		req, _ := http.NewRequest("GET", toolURL, nil)
@@ -1108,17 +1333,16 @@ func mergeOpenAPI(inst Instance, baseURL string) ([]byte, error) {
 		}
 		resp, err := client.Do(req)
 		if err != nil {
-			return nil, fmt.Errorf("fetch %s: %w", toolURL, err)
+			return nil, nil, nil, fmt.Errorf("fetch %s: %w", toolURL, err)
 		}
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if resp.StatusCode != 200 {
-			return nil, fmt.Errorf("fetch %s: status %s\n%s", toolURL, resp.Status, string(body))
+			return nil, nil, nil, fmt.Errorf("fetch %s: status %s\n%s", toolURL, resp.Status, string(body))
 		}
-
 		var spec map[string]any
 		if err := json.Unmarshal(body, &spec); err != nil {
-			return nil, fmt.Errorf("parse %s: %w", toolURL, err)
+			return nil, nil, nil, fmt.Errorf("parse %s: %w", toolURL, err)
 		}
 
 		// Collect local component keys from the ORIGINAL to know which refs are local.
@@ -1133,7 +1357,6 @@ func mergeOpenAPI(inst Instance, baseURL string) ([]byte, error) {
 				}
 			}
 		}
-
 		// Work on a deep copy and rewrite all $refs to namespaced form BEFORE moving anything.
 		spec = deepCopy(spec).(map[string]any)
 		rewriteRefs(spec, name, localKeys)
@@ -1156,23 +1379,43 @@ func mergeOpenAPI(inst Instance, baseURL string) ([]byte, error) {
 		// Merge paths with prefix; remove per-op security (rely on top-level).
 		if p, ok := spec["paths"].(map[string]any); ok {
 			for rawPath, v := range p {
+				toolName := toolNameFromRawPath(rawPath)
+				if !ov.allowed(name, toolName) {
+					continue
+				}
+
 				newPath := "/" + strings.TrimLeft(name, "/") + ensureLeadingSlash(rawPath)
+
 				if m, ok := v.(map[string]any); ok {
 					for method, op := range m {
 						om, ok := op.(map[string]any)
 						if !ok {
 							continue
 						}
+						// operationId
 						if oid, ok := om["operationId"].(string); ok && oid != "" {
 							om["operationId"] = name + "__" + oid
 						} else {
 							om["operationId"] = name + "__" + strings.ToLower(method) + "_" + sanitizeForID(rawPath)
+						}
+						// Trim or override descriptions (per-tool) to respect 300-char limit.
+						if ov != nil && ov.Descriptions != nil && ov.Descriptions[name] != nil {
+							if d, ok := ov.Descriptions[name][toolName]; ok && d != "" {
+								om["description"] = d
+							}
+						}
+						// If still too long, compute warning
+						if desc, ok := om["description"].(string); ok && len([]rune(desc)) > descLimit {
+							perServerWarns[name] = append(perServerWarns[name],
+								fmt.Sprintf("%s %s (tool=%s): description length %d > %d",
+									strings.ToUpper(method), newPath, toolName, len([]rune(desc)), descLimit))
 						}
 						// Cleanup: remove any per-operation security (duplicate of top-level).
 						delete(om, "security")
 					}
 				}
 				pathsOut[newPath] = v
+				perServerCounts[name] += countHTTPMethods(m)
 			}
 		}
 	}
@@ -1184,9 +1427,31 @@ func mergeOpenAPI(inst Instance, baseURL string) ([]byte, error) {
 		tightenResponses(paths)
 	}
 	coerceIntegerTypes(merged)
-
 	out, _ := json.MarshalIndent(merged, "", "  ")
-	return out, nil
+	return out, perServerWarns, perServerCounts, nil
+}
+
+
+// countHTTPMethods counts HTTP operation keys on a Path Item object.
+func countHTTPMethods(m map[string]any) int {
+	methods := 0
+	for k := range m {
+		switch strings.ToLower(k) {
+		case "get", "post", "put", "delete", "patch", "options", "head", "trace", "connect":
+			methods++
+		}
+	}
+	return methods
+}
+
+// toolNameFromRawPath extracts first segment from a raw OpenAPI path like "/read_text_file" or "read_text_file".
+func toolNameFromRawPath(p string) string {
+	p = strings.TrimPrefix(p, "/")
+	if p == "" {
+		return ""
+	}
+	parts := strings.SplitN(p, "/", 2)
+	return parts[0]
 }
 
 // rewriteRefs recursively rewrites local component $refs to namespaced form "<tool>__Name".
@@ -1247,7 +1512,7 @@ func countOperations(spec []byte) int {
 		if mm, ok := v.(map[string]any); ok {
 			for mk := range mm {
 				if _, ok := methods[strings.ToLower(mk)]; ok {
-					count++
+					count++;
 				}
 			}
 		}
@@ -1515,4 +1780,13 @@ func isIntegralNumber(v any) bool {
 	default:
 		return false
 	}
+}
+
+// --- small util ---
+func mapsKeys[K comparable, V any](m map[K]V) []K {
+	ks := make([]K, 0, len(m))
+	for k := range m {
+		ks = append(ks, k)
+	}
+	return ks
 }

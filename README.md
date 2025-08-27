@@ -22,62 +22,28 @@
 
 ---
 
-## Why multi‑config? (OpenAI ~30 tools per Action)
+## What’s new (this build)
 
-Custom GPT Actions currently handle roughly **30 tools**. If your MCP servers exceed that, **split** them across multiple config files. `mcp-launch` can boot **multiple stacks** at once (one per config), each with its own `/openapi.json` and API key, so you can import them into **separate GPTs/chats**.
+- **Warn on long descriptions:** detects **tool descriptions > 300 chars**, summarized per MCP server (details only with `-v`/`-vv` or in `--log-file`).
+- **Per‑server “30+ tools” warning:** keep your overall count, but now also show a warning **per server** when it exposes 30+ tools.
+- **Optional TUI preflight** (Bubble Tea v1):
+  - Edit **Allowed tools** (multi‑select)
+  - Edit **Disallowed tools** (multi‑select)
+  - Edit **Tool descriptions** (`+` sets trimmed ≤300; `-` clears)
+  - **Disable/Enable** server
+  - Choose **launch mode**:
+    - **Via mcpo** (HTTP + OpenAPI; your current flow)
+    - **Raw MCP** (stdio only; useful for running servers without mcpo)
 
-Examples:
-
-```bash
-# Two stacks via Quick Tunnels (independent URLs + keys):
-mcp-launch up \
-  --config code.json \
-  --config data.json \
-  --tunnel quick
-
-# Two named stacks with stable hosts and a single shared API key:
-mcp-launch up \
-  --config code.json --public-url https://gpt-code.example.com \
-  --config data.json --public-url https://gpt-data.example.com \
-  --tunnel named --tunnel-name my-tunnel \
-  --api-key SECRET --shared-key
-```
-
----
-
-## How it works
-
-```text
-                 spawns/loads (stdio/SSE/HTTP)             HTTP (OpenAPI + tools)
-+------------+  --------------------------------------->   +-------------+
-| mcp-launch |                                             |  mcpo :8800 |
-+------------+                                             +-------------+
-      |
-      | front proxy :8000.. :8000+N-1
-      |   - serves /openapi.json (per stack)
-      |   - proxies everything else to that stack's mcpo
-      v
-+-------------+            public HTTPS (per stack)
-| cloudflared | ---------------------------------------> https://host-A
-+-------------+                                          https://host-B
-                                                         ...
-mcpo connects to MCP servers defined in each mcp.config.json:
-
-+-------------+   +--------------+   +-----------+    ...
-|  Serena MCP |   |  Filesystem  |   |  Time MCP |
-+-------------+   +--------------+   +-----------+
-```
-
-- `mcpo` exposes each MCP server at `/<name>` with docs at `/<name>/docs`.
-- The front proxy **serves `/openapi.json`** on the **same host/port** it proxies to `mcpo`.
-- With Cloudflare (Quick or Named), you get a public HTTPS URL **per stack** to share with ChatGPT.
+> The TUI inspects tools via MCP’s standard `initialize` → `tools/list` flow over **stdio**; we don’t reinvent discovery. (Docs: MCP tools/list & architecture.)  
+> It then clones your configs to `.mcp-launch/tmp/<name>/mcp.config.json` and applies only safe edits (disabling servers) to the clones; description/allow/deny overrides are applied during merge when launching via `mcpo`.  
 
 ---
 
 ## Prerequisites
 
 - **Go 1.22+**
-- **mcpo** (Python; `pipx install mcpo` or `uv tool install mcpo`)
+- **mcpo** (`pipx install mcpo` or `uv tool install mcpo`)
 - **cloudflared**
 - Optional: **uv** (`uvx`) and **node** (`npx`) if your MCP servers use them
 
@@ -87,6 +53,7 @@ mcpo connects to MCP servers defined in each mcp.config.json:
 
 ```bash
 git clone <your fork> mcp-launch && cd mcp-launch
+go mod tidy
 go build -o mcp-launch
 # Windows: go build -o mcp-launch.exe
 ```
@@ -96,7 +63,7 @@ go build -o mcp-launch
 ## Quick start (dev)
 
 ```bash
-# 1) Generate a default Claude-style config + state
+# 1) Generate default config + state
 ./mcp-launch init
 
 # 2) Bring everything up using an ephemeral Cloudflare Quick Tunnel
@@ -122,17 +89,20 @@ Stop with **Ctrl‑C** (tears down mcpo, spawned MCP servers, the proxy, and clo
 
 ---
 
-## Stable setup (prod)
-
-Use a **Named Tunnel** for a stable domain you own.
+## TUI preflight (optional)
 
 ```bash
-./mcp-launch up --tunnel named \
-  --public-url https://gpt-tools.example.com \
-  --tunnel-name <YOUR_TUNNEL_NAME>
+./mcp-launch up --tui --tunnel none   # discover→edit→choose launch mode
 ```
 
-Paste **`https://gpt-tools.example.com/openapi.json`** into ChatGPT.
+**Keys**
+- Server list: `↑/↓`, `Enter` (edit), `c` (continue), `q` (quit)
+- Allowed/Disallowed editors: `↑/↓`, `space` (toggle), `enter` (save), `b` (back)
+- Descriptions: `↑/↓`, `+` set trimmed (≤300), `-` clear, `enter`/`b` back
+- Launch chooser: `1` = mcpo, `2` = raw, `enter` = mcpo, `b` back
+
+> In **raw** mode we launch stdio servers only (no mcpo/OpenAPI/tunnel).  
+> In **mcpo** mode everything works as before, plus the new warnings.
 
 ---
 
@@ -144,8 +114,6 @@ Paste **`https://gpt-tools.example.com/openapi.json`** into ChatGPT.
    https://gpt-code.example.com/openapi.json
    ```
 3. Auth: **API Key** → header **`X-API-Key`** → paste the key printed by `up` (also in `mcp-launch status`).
-
-Repeat for each stack if you split configs.
 
 ---
 
@@ -164,10 +132,9 @@ Repeat for each stack if you split configs.
     --tunnel MODE        quick | named | none (default: quick)
     --public-url URL     Public base URL (repeatable; align with --config or single for all)
     --tunnel-name NAME   cloudflared tunnel name (for --tunnel named)
-    -v                   Verbose (INFO) and stream subprocess logs
-    -vv                  Debug (DEBUG) and stream subprocess logs
-    --stream             Stream subprocess logs without changing verbosity
-    --log-file PATH      Append logs to file (created if missing)
+    --tui                Run the TUI preflight (edit & launch mode)
+    -v / -vv             Verbose / debug (prints long-description offenders)
+    --log-file PATH      Tee all logs to file
     ```
 
 - `status` — Show each stack’s ports, public URL, tools, and API key header.
@@ -175,47 +142,19 @@ Repeat for each stack if you split configs.
 - `openapi` — Regenerate merged OpenAPI for each running stack.
   - Options:
     ```
-    --public-url URL     Repeatable; one per running stack (or one applied to all)
+    --public-url URL     One per running stack (or one applied to all)
     ```
 
-- `share` — Print `/openapi.json` URL(s) per stack for easy copy/paste.
+- `share` — Print `/openapi.json` URL(s) per stack.
 
 - `down` — Stop cloudflared and **mcpo + its child MCP servers** for **all** stacks.
 
 - `doctor` — Check required binaries.
 
-### Default output vs verbose
+### Output behavior
 
-- **Default:** only essentials → per‑stack schema URL(s) and `X‑API‑Key` values. No log spam.
-- **`-v` / `-vv`:** stream `mcpo`/`cloudflared` logs and print extra details like chosen ports.
-- **`--log-file`:** always captures *everything* (our messages + subprocess output), regardless of verbosity.
-
----
-
-## Configuration reference (`mcp.config.json`)
-
-```json
-{
-  "mcpServers": {
-    "serena": {
-      "command": "uvx",
-      "args": [
-        "--from", "git+https://github.com/oraios/serena",
-        "serena", "start-mcp-server",
-        "--context", "ide-assistant"
-      ]
-    },
-    "filesystem": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
-    },
-    "time": {
-      "command": "uvx",
-      "args": ["mcp-server-time", "--local-timezone=America/Phoenix"]
-    }
-  }
-}
-```
+- **Default:** minimal summary + per‑server one‑liners (if any tool has `description > 300` and/or tool count ≥ 30).  
+  Add `-v`/`-vv` (or `--log-file`) to see **each** offending operation with method/path/tool/length.
 
 ---
 
@@ -232,8 +171,7 @@ Repeat for each stack if you split configs.
   ```bash
   mcp-launch openapi --public-url https://your-host
   ```
-- **Noisy console** — Only with `-v`/`-vv`/`--stream`. Default output is minimal. Use `--log-file` to capture details without cluttering the terminal.
-- **Ctrl‑C didn’t stop everything** — Fixed: we kill each stack’s **mcpo** process group (so its spawned MCP servers too) and cloudflared.
+- **Ctrl‑C didn’t stop everything** — We kill each stack’s **mcpo** process group (so its spawned MCP servers too) and cloudflared.
 
 ---
 
