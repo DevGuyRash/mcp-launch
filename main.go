@@ -291,6 +291,22 @@ func (s *stringSlice) Set(v string) error {
 	return nil
 }
 
+// Reserve an actually-free TCP port >= start that hasn't already been picked
+// for another stack in this run.
+func reservePort(start int, taken map[int]bool) int {
+	p := start
+	for tries := 0; tries < 4096; tries++ {
+		if !taken[p] && isFree(p) {
+			taken[p] = true
+			return p
+		}
+		p++
+	}
+	// Fallback: mark start as taken; Serve() would fail and we will log it.
+	taken[start] = true
+	return start
+}
+
 func cmdUp() {
 	fs := flag.NewFlagSet("up", flag.ExitOnError)
 	fs.Usage = func() { helpTopic("up") }
@@ -353,13 +369,22 @@ func cmdUp() {
 
 	// Build instance plans
 	instances := make([]Instance, 0, len(configs))
+	// NEW: track ports we reserve during planning so stacks don't collide
+	takenFront := map[int]bool{}
+	takenMcpo := map[int]bool{}
+
 	for i, cfgPath := range configs {
 		name := nameFromPath(cfgPath, i)
+
+		// NEW: choose unique, actually-free ports per stack
+		front := reservePort(*port+i, takenFront)
+		mcpoP := reservePort(*mcpoPort+i, takenMcpo)
+
 		inst := Instance{
 			Name:       name,
 			ConfigPath: cfgPath,
-			FrontPort:  pickPort(*port + i),
-			McpoPort:   pickPort(*mcpoPort + i),
+			FrontPort:  front,
+			McpoPort:   mcpoP,
 			TunnelMode: *tunnel,
 			TunnelName: *tunnelName,
 		}
