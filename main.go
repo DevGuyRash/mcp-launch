@@ -18,15 +18,17 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
-const Version = "0.2.0"
+const Version = "0.2.1"
 
 const (
 	defaultFrontPort = 8000
@@ -121,6 +123,7 @@ QUICK START
   # Paste the printed https://.../openapi.json into Custom GPT → Actions → Import from URL
 
 NOTES
+  • Ctrl-C on 'up' will stop mcpo, its spawned MCP servers, the front proxy, and cloudflared.
   • Front proxy listens on --port (default 8000) and serves /openapi.json on the same host&port it proxies.
   • mcpo listens on --mcpo-port (default 8800).
   • The API key is required on all requests (header X-API-Key). It is generated if not provided.
@@ -134,6 +137,7 @@ func helpTopic(name string) {
 		fmt.Println(`USAGE
   mcp-launch up [--config PATH] [--port N] [--mcpo-port N] [--api-key KEY]
                  [--tunnel quick|named|none] [--public-url URL] [--tunnel-name NAME]
+                 [-v | -vv] [--quiet]
 
 OPTIONS
   --config PATH          Claude-style config (default: mcp.config.json)
@@ -143,6 +147,9 @@ OPTIONS
   --tunnel MODE          quick | named | none (default: quick)
   --public-url URL       Public base URL used in the merged OpenAPI (recommended for named/none)
   --tunnel-name NAME     Named tunnel to run (cloudflared tunnel run NAME)
+  -v                     Verbose logs from this CLI
+  -vv                    Debug logs from this CLI
+  --quiet                Suppress subprocess logs (mcpo/cloudflared) in console
 
 EXAMPLES
   # Dev (ephemeral URL):
@@ -248,6 +255,9 @@ func cmdUp() {
 	tunnel := fs.String("tunnel", "quick", "Tunnel mode: quick|named|none")
 	publicURL := fs.String("public-url", "", "Public base URL (required for named or none if you want merged spec to be correct)")
 	tunnelName := fs.String("tunnel-name", "", "Named tunnel to run (optional; requires local cloudflared config)")
+	verbose := fs.Bool("v", false, "Verbose logs")
+	debug := fs.Bool("vv", false, "Debug logs")
+	quiet := fs.Bool("quiet", false, "Suppress mcpo/cloudflared logs")
 	_ = fs.Parse(os.Args[2:])
 
 	ensureStateDir()
@@ -268,8 +278,19 @@ func cmdUp() {
 	}
 	saveState(&st)
 
+	verbosity := 0
+	if *debug {
+		verbosity = 2
+	} else if *verbose {
+		verbosity = 1
+	}
+
 	// Start mcpo
 	mcpoCmd := exec.Command(findBinary("mcpo"), "--port", fmt.Sprint(st.McpoPort), "--api-key", st.APIKey, "--config", st.ConfigPath, "--hot-reload")
+	// Put mcpo in its own process group so we can kill the whole tree (mcpo + spawned MCP servers)
+	if runtime.GOOS != "windows" {
+		mcpoCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	}
 	mcpoStdout, _ := mcpoCmd.StdoutPipe()
 	mcpoStderr, _ := mcpoCmd.StderrPipe()
 	if err := mcpoCmd.Start(); err != nil {
@@ -278,9 +299,10 @@ func cmdUp() {
 	}
 	st.McpoPID = mcpoCmd.Process.Pid
 	saveState(&st)
-
-	go streamPrefixed("mcpo", mcpoStdout)
-	go streamPrefixed("mcpo", mcpoStderr)
+	if !*quiet {
+		go streamPrefixed("mcpo", mcpoStdout)
+		go streamPrefixed("mcpo", mcpoStderr)
+	}
 	waitURL(fmt.Sprintf("http://127.0.0.1:%d/docs", st.McpoPort), 60*time.Second)
 
 	// Determine tool names from config
@@ -305,7 +327,7 @@ func cmdUp() {
 	var quickURL string
 	switch st.TunnelMode {
 	case "quick":
-		quickURL = startQuickTunnel(st.FrontPort)
+		quickURL = startQuickTunnel(st.FrontPort, *quiet)
 		if quickURL == "" {
 			fmt.Println("Quick Tunnel failed; continuing without a public URL.")
 		} else {
@@ -346,13 +368,49 @@ func cmdUp() {
 	} else {
 		fmt.Printf("http://127.0.0.1:%d/openapi.json (local only)\n", st.FrontPort)
 	}
-	fmt.Println("API key header: X-API-Key:", st.APIKey)
+	fmt.Println("API key header: X-API-Key:", st.APIKey, "(saved in .mcp-launch/state.json; also see `mcp-launch status`)")
 	fmt.Println()
 
-	// Stream until interrupted
-	fmt.Println("Press Ctrl+C to stop (or run `mcp-launch down` from another shell).")
-	// Wait on mcpo; if it exits, we exit
-	_ = mcpoCmd.Wait()
+	// Handle signals and mcpo exit
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	mcpoDone := make(chan error, 1)
+	go func() { mcpoDone <- mcpoCmd.Wait() }()
+
+	if verbosity > 0 {
+		fmt.Println("Press Ctrl+C to stop (or run `mcp-launch down` from another shell).")
+	}
+
+	cleanup := func() {
+		// stop proxy
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = proxy.Close(ctx)
+		cancel()
+		// stop cloudflared
+		if st.CloudflaredPID > 0 {
+			_ = killPID(st.CloudflaredPID)
+			st.CloudflaredPID = 0
+		}
+		// stop mcpo tree (and all spawned MCP servers)
+		if st.McpoPID > 0 {
+			_ = killProcessTree(st.McpoPID)
+			st.McpoPID = 0
+		}
+		saveState(&st)
+	}
+
+	select {
+	case <-sigCh:
+		if verbosity > 0 {
+			fmt.Println("\nReceived signal, shutting down…")
+		}
+		cleanup()
+	case err := <-mcpoDone:
+		if err != nil && verbosity > 0 {
+			fmt.Println("\nmcpo exited:", err)
+		}
+		cleanup()
+	}
 }
 
 func cmdStatus() {
@@ -387,10 +445,10 @@ func cmdDown() {
 		fmt.Println("Stopped cloudflared (pid", st.CloudflaredPID, ")")
 		st.CloudflaredPID = 0
 	}
-	// Kill mcpo
+	// Kill mcpo (+ children)
 	if st.McpoPID > 0 {
-		_ = killPID(st.McpoPID)
-		fmt.Println("Stopped mcpo (pid", st.McpoPID, ")")
+		_ = killProcessTree(st.McpoPID)
+		fmt.Println("Stopped mcpo (pid", st.McpoPID, ") and its child MCP servers")
 		st.McpoPID = 0
 	}
 	saveState(&st)
@@ -436,17 +494,21 @@ func ensureStateDir() string {
 	_ = os.MkdirAll(dir, 0o755)
 	return dir
 }
+
 func getStateDir() string {
 	return filepath.Join(".", stateDirName)
 }
+
 func statePath() string {
 	return filepath.Join(getStateDir(), stateFileName)
 }
+
 func saveState(st *State) {
 	_ = os.MkdirAll(getStateDir(), 0o755)
 	data, _ := json.MarshalIndent(st, "", "  ")
 	_ = os.WriteFile(statePath(), data, 0644)
 }
+
 func loadState() State {
 	path := statePath()
 	var st State
@@ -515,6 +577,7 @@ func pickPort(preferred int) int {
 	}
 	return preferred
 }
+
 func isFree(port int) bool {
 	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
@@ -567,15 +630,21 @@ func (f *frontProxy) Serve() error {
 	fmt.Printf("Front proxy listening on http://127.0.0.1:%d\n", f.st.FrontPort)
 	return f.srv.ListenAndServe()
 }
+
 func (f *frontProxy) SetOpenAPI(spec []byte) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.spec = spec
 }
 
-func startQuickTunnel(frontPort int) string {
+func (f *frontProxy) Close(ctx context.Context) error {
+	return f.srv.Shutdown(ctx)
+}
+
+func startQuickTunnel(frontPort int, quiet bool) string {
 	bin := findBinary("cloudflared")
 	cmd := exec.Command(bin, "tunnel", "--url", fmt.Sprintf("http://127.0.0.1:%d", frontPort))
+	// Keep default process-group behavior; we kill by PID directly for cloudflared
 	stdout, _ := cmd.StdoutPipe()
 	stderr, _ := cmd.StderrPipe()
 	if err := cmd.Start(); err != nil {
@@ -592,7 +661,9 @@ func startQuickTunnel(frontPort int) string {
 		sc := bufio.NewScanner(r)
 		for sc.Scan() {
 			line := sc.Text()
-			fmt.Println("[cloudflared]", line)
+			if !quiet {
+				fmt.Println("[cloudflared]", line)
+			}
 			if strings.Contains(line, "trycloudflare.com") {
 				u := findFirstURL(line)
 				if u != "" {
@@ -603,7 +674,6 @@ func startQuickTunnel(frontPort int) string {
 	}
 	go parse(stdout)
 	go parse(stderr)
-
 	select {
 	case u := <-urlCh:
 		return strings.TrimSuffix(u, "/")
@@ -630,12 +700,35 @@ func startNamedTunnel(name string) {
 }
 
 func killPID(pid int) error {
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		return err
+	if pid <= 0 {
+		return nil
 	}
-	// Windows does not support Kill with signals; Go abstracts it
-	return process.Kill()
+	if runtime.GOOS == "windows" {
+		// Kill the process tree (/T) forcefully (/F)
+		return exec.Command("taskkill", "/PID", fmt.Sprint(pid), "/T", "/F").Run()
+	}
+	pr, err := os.FindProcess(pid)
+	if err == nil {
+		_ = pr.Signal(syscall.SIGTERM)
+		time.Sleep(300 * time.Millisecond)
+	}
+	return nil
+}
+
+// killProcessTree kills a process and (on Unix) its entire process group.
+func killProcessTree(pid int) error {
+	if pid <= 0 {
+		return nil
+	}
+	if runtime.GOOS == "windows" {
+		return exec.Command("taskkill", "/PID", fmt.Sprint(pid), "/T", "/F").Run()
+	}
+	// Send SIGTERM to process group (-pid)
+	_ = syscall.Kill(-pid, syscall.SIGTERM)
+	time.Sleep(800 * time.Millisecond)
+	// If still alive, SIGKILL the group
+	_ = syscall.Kill(-pid, syscall.SIGKILL)
+	return nil
 }
 
 func waitURL(u string, timeout time.Duration) {
@@ -674,13 +767,11 @@ func findFirstURL(s string) string {
 }
 
 // -------- OpenAPI merge --------
-
 func mergeOpenAPI(st State, baseURL string) ([]byte, error) {
 	cfg := readConfig(st.ConfigPath)
 	if len(cfg.MCPServers) == 0 {
 		return nil, fmt.Errorf("no mcpServers in %s", st.ConfigPath)
 	}
-
 	merged := map[string]any{
 		"openapi": "3.1.0",
 		"info": map[string]any{
@@ -708,17 +799,14 @@ func mergeOpenAPI(st State, baseURL string) ([]byte, error) {
 		},
 		"paths": map[string]any{},
 	}
-
 	pathsOut := merged["paths"].(map[string]any)
 	comp := merged["components"].(map[string]any)
-
 	// iterate tool names deterministically
 	names := make([]string, 0, len(cfg.MCPServers))
 	for name := range cfg.MCPServers {
 		names = append(names, name)
 	}
 	slices.Sort(names)
-
 	client := &http.Client{Timeout: 30 * time.Second}
 	for _, name := range names {
 		toolURL := fmt.Sprintf("http://127.0.0.1:%d/%s/openapi.json", st.McpoPort, name)
@@ -740,7 +828,6 @@ func mergeOpenAPI(st State, baseURL string) ([]byte, error) {
 		if err := json.Unmarshal(body, &spec); err != nil {
 			return nil, fmt.Errorf("parse %s: %w", toolURL, err)
 		}
-
 		// Prefix $refs for components we are going to rename
 		localComp, _ := spec["components"].(map[string]any)
 		sections := []string{"schemas", "parameters", "responses", "requestBodies"}
@@ -757,7 +844,6 @@ func mergeOpenAPI(st State, baseURL string) ([]byte, error) {
 		// Deep copy before rewrite
 		spec = deepCopy(spec).(map[string]any)
 		rewriteRefs(spec, name, localKeys)
-
 		// Move and rename components
 		if localComp != nil {
 			for _, sec := range sections {
@@ -771,7 +857,6 @@ func mergeOpenAPI(st State, baseURL string) ([]byte, error) {
 				}
 			}
 		}
-
 		// Merge paths with prefix
 		if p, ok := spec["paths"].(map[string]any); ok {
 			for rawPath, v := range p {
@@ -795,7 +880,6 @@ func mergeOpenAPI(st State, baseURL string) ([]byte, error) {
 			}
 		}
 	}
-
 	out, _ := json.MarshalIndent(merged, "", "  ")
 	return out, nil
 }

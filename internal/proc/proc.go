@@ -35,18 +35,17 @@ func (s *Supervisor) Start(name string, cmd *exec.Cmd) (*Child, error) {
 	defer s.mu.Unlock()
 	if _, ok := s.childs[name]; ok {
 		return nil, fmt.Errorf("%s already started", name)
-	}	stderr, _ := cmd.StderrPipe()
+	}
+	stderr, _ := cmd.StderrPipe()
 	stdout, _ := cmd.StdoutPipe()
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
 	ch := &Child{Cmd: cmd, Name: name}
 	s.childs[name] = ch
-
 	// Log pipes
 	go s.pipeLogs(name, stdout)
 	go s.pipeLogs(name, stderr)
-
 	return ch, nil
 }
 

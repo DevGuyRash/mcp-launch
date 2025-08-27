@@ -80,7 +80,7 @@ flowchart LR
   end
 
   FP --> D[Cloudflare Tunnel]
-  D --> E["https\://your-host"]
+  D --> E["https://your-host"]
 
   subgraph MCP_Servers[Configured MCP servers]
     S[Serena MCP]
@@ -149,6 +149,7 @@ go build -o mcp-launch.exe
 
 # 3) Copy the printed URL ending in /openapi.json
 #    (e.g., https://random.trycloudflare.com/openapi.json)
+#    and the printed API key (also saved in .mcp-launch/state.json; see `mcp-launch status`)
 ```
 
 You can explore per‑tool docs in your browser:
@@ -159,7 +160,7 @@ https://<public>/time/docs
 ...
 ```
 
-Stop:
+Stop with **Ctrl‑C** (tears down mcpo, spawned MCP servers, the proxy, and cloudflared), or:
 
 ```bash
 ./mcp-launch down
@@ -196,9 +197,9 @@ You’ll paste **`https://gpt-tools.example.com/openapi.json`** into ChatGPT onc
    ```
 
 3. Set **Authentication** to **API Key**, header **`X-API-Key`**.
-4. Paste the same key that `mcp-launch up` printed.
+4. Paste the same key that `mcp-launch up` printed (also shown by `mcp-launch status`).
 
-That’s all—your GPT now sees *all* your MCP tools through one Action.
+That’s all—your GPT now sees _all_ your MCP tools through one Action.
 
 ---
 
@@ -222,6 +223,9 @@ Options:
 --tunnel MODE        quick | named | none (default: quick)
 --public-url URL     Public base URL used inside the merged OpenAPI (recommended for named/none)
 --tunnel-name NAME   Named tunnel to run (for --tunnel named)
+-v                   Verbose logs
+-vv                  Debug logs
+--quiet              Suppress subprocess logs (mcpo/cloudflared) in console
 ```
 
 **`status`**
@@ -239,7 +243,7 @@ Options:
 Print the single URL ending in `/openapi.json` for easy copy/paste.
 
 **`down`**
-Stop `cloudflared` and `mcpo` processes that were started by this tool.
+Stop `cloudflared` and **mcpo + its child MCP servers**.
 
 **`doctor`**
 Check for required binaries (`mcpo`, `cloudflared`), plus `uvx` and `npx` if your config references them.
