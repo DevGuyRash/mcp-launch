@@ -7,6 +7,7 @@ import (
     "errors"
     "fmt"
     "io"
+    "os"
     "os/exec"
     "strings"
     "time"
@@ -44,13 +45,18 @@ func inspectStdio(ctx context.Context, name string, s cfg.MCPServer) (Summary, e
         return Summary{ServerName: name}, fmt.Errorf("server %s missing command", name)
     }
     cmd := exec.CommandContext(ctx, s.Command, s.Args...)
-    // apply env if present
+    // Inherit parent env; if overrides present, replace keys rather than append duplicates.
     if len(s.Env) > 0 {
-        env := make([]string, 0, len(s.Env))
-        for k, v := range s.Env {
-            env = append(env, fmt.Sprintf("%s=%s", k, v))
+        em := map[string]string{}
+        for _, kv := range os.Environ() {
+            if i := strings.IndexByte(kv, '='); i >= 0 {
+                em[kv[:i]] = kv[i+1:]
+            }
         }
-        cmd.Env = append(cmd.Env, env...)
+        for k, v := range s.Env { em[k] = v }
+        env := make([]string, 0, len(em))
+        for k, v := range em { env = append(env, fmt.Sprintf("%s=%s", k, v)) }
+        cmd.Env = env
     }
     stdin, err := cmd.StdinPipe()
     if err != nil {
