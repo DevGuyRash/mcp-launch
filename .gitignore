@@ -1,0 +1,14 @@
+# build artifacts
+mcp-launch
+dist/
+bin/
+*.exe
+*.zip
+*.tar.gz
+
+# state
+.mcp-launch/
+mcp-launch
+
+# misc
+*repomix*
