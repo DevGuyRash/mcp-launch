@@ -11,18 +11,18 @@ import (
 // namespacing operationIds, and merging components/schemas conservatively.
 func Merge(serverToSpec map[string][]byte) ([]byte, error) {
 	type OA struct {
-		OpenAPI string                 `json:"openapi,omitempty"`
-		Info    map[string]any         `json:"info,omitempty"`
-		Servers []map[string]any       `json:"servers,omitempty"`
-		Paths   map[string]any         `json:"paths"`
-		Comps   map[string]any         `json:"components,omitempty"`
-		Security []map[string]any      `json:"security,omitempty"`
+		OpenAPI  string           `json:"openapi,omitempty"`
+		Info     map[string]any   `json:"info,omitempty"`
+		Servers  []map[string]any `json:"servers,omitempty"`
+		Paths    map[string]any   `json:"paths"`
+		Comps    map[string]any   `json:"components,omitempty"`
+		Security []map[string]any `json:"security,omitempty"`
 	}
 	final := OA{
-		OpenAPI: "3.1.0",
-		Info: map[string]any{"title": "MCP Tools via mcpo", "version": "1.0.0"},
-		Paths: map[string]any{},
-		Comps: map[string]any{"schemas": map[string]any{}, "securitySchemes": map[string]any{}},
+		OpenAPI:  "3.1.0",
+		Info:     map[string]any{"title": "MCP Tools via mcpo", "version": "1.0.0"},
+		Paths:    map[string]any{},
+		Comps:    map[string]any{"schemas": map[string]any{}, "securitySchemes": map[string]any{}},
 		Security: []map[string]any{{"mcpoApiKey": []any{}}},
 	}
 	// Inject our apiKey header
@@ -73,12 +73,12 @@ func Merge(serverToSpec map[string][]byte) ([]byte, error) {
 	}
 	// Servers will be filled in by callers (the public baseUrl) if desired
 	out := map[string]any{
-		"openapi": final.OpenAPI,
-		"info":    final.Info,
-		"servers": []map[string]any{}, // set by writer
-		"paths":   final.Paths,
+		"openapi":    final.OpenAPI,
+		"info":       final.Info,
+		"servers":    []map[string]any{}, // set by writer
+		"paths":      final.Paths,
 		"components": final.Comps,
-		"security": final.Security,
+		"security":   final.Security,
 	}
 	return json.MarshalIndent(out, "", "  ")
 }

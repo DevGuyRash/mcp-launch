@@ -3,11 +3,10 @@
 // mcp-launch: minimal supervisor for mcpo + merged OpenAPI + Cloudflare tunnel
 package main
 
-const Version = "0.2.0"
-
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -25,8 +24,9 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"crypto/rand"
 )
+
+const Version = "0.2.0"
 
 const (
 	defaultFrontPort = 8000
@@ -49,17 +49,17 @@ type MCPConfig struct {
 }
 
 type State struct {
-	APIKey        string   `json:"api_key"`
-	ConfigPath    string   `json:"config_path"`
-	FrontPort     int      `json:"front_port"`
-	McpoPort      int      `json:"mcpo_port"`
-	PublicURL     string   `json:"public_url"`
-	TunnelMode    string   `json:"tunnel_mode"` // quick|named|none
-	TunnelName    string   `json:"tunnel_name,omitempty"`
-	CloudflaredPID int     `json:"cloudflared_pid"`
-	McpoPID       int      `json:"mcpo_pid"`
-	ToolNames     []string `json:"tool_names"`
-	StartedAt     string   `json:"started_at"`
+	APIKey         string   `json:"api_key"`
+	ConfigPath     string   `json:"config_path"`
+	FrontPort      int      `json:"front_port"`
+	McpoPort       int      `json:"mcpo_port"`
+	PublicURL      string   `json:"public_url"`
+	TunnelMode     string   `json:"tunnel_mode"` // quick|named|none
+	TunnelName     string   `json:"tunnel_name,omitempty"`
+	CloudflaredPID int      `json:"cloudflared_pid"`
+	McpoPID        int      `json:"mcpo_pid"`
+	ToolNames      []string `json:"tool_names"`
+	StartedAt      string   `json:"started_at"`
 }
 
 func main() {
@@ -126,8 +126,8 @@ NOTES
   • The API key is required on all requests (header X-API-Key). It is generated if not provided.
   • State lives in ./.mcp-launch/state.json (ports, API key, public URL, etc).
 `)
-	}
-	
+}
+
 func helpTopic(name string) {
 	switch name {
 	case "up":
@@ -163,8 +163,6 @@ DESCRIPTION
 	default:
 		usage()
 	}
-}
-	
 }
 
 func cmdInit() {
@@ -222,7 +220,9 @@ func cmdDoctor() {
 	fmt.Println("Dependency checks:")
 	ok := true
 	for _, bin := range checks {
-		if bin == "" { continue }
+		if bin == "" {
+			continue
+		}
 		_, err := exec.LookPath(bin)
 		if err != nil {
 			fmt.Printf("  ✗ %s not found in PATH\n", bin)
@@ -525,11 +525,11 @@ func isFree(port int) bool {
 }
 
 type frontProxy struct {
-	st     State
-	srv    *http.Server
-	proxy  *httputil.ReverseProxy
-	mu     sync.RWMutex
-	spec   []byte // merged openapi
+	st    State
+	srv   *http.Server
+	proxy *httputil.ReverseProxy
+	mu    sync.RWMutex
+	spec  []byte // merged openapi
 }
 
 func newFrontProxy(st State) *frontProxy {

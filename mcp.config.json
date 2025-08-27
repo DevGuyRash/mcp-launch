@@ -8,7 +8,7 @@
         "serena",
         "start-mcp-server",
         "--context",
-        "ide-assistant"
+        "chatgpt"
       ]
     },
     "time": {
