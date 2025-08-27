@@ -568,6 +568,10 @@ func cmdUp() {
             inst.OperationCount = countOperations(spec)
             inst.ServerWarns = perServerWarns
             inst.ServerOpCounts = perServerCounts
+            inst.ServerLongDescCounts = map[string]int{}
+            for sname, ws := range perServerWarns {
+                inst.ServerLongDescCounts[sname] = len(ws)
+            }
             saveStateMulti(&st, instances)
 
             // quick sanity check: dangling component refs?
