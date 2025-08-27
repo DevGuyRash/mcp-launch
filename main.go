@@ -65,6 +65,8 @@ type Instance struct {
 	CloudflaredPID int      `json:"cloudflared_pid"`
 	McpoPID        int      `json:"mcpo_pid"`
 	ToolNames      []string `json:"tool_names"`
+	// NEW: number of OpenAPI operations (the “tools” that count toward the ~30 limit)
+	OperationCount int `json:"operation_count"`
 }
 
 type State struct {
@@ -467,6 +469,10 @@ func cmdUp() {
 		if err != nil {
 			fmt.Printf("[openapi#%s] merge failed: %v\n", inst.Name, err)
 		} else {
+			// Count operations (“tools” in GPT Actions)
+			inst.OperationCount = countOperations(spec)
+			saveStateMulti(&st, instances)
+
 			proxy.SetOpenAPI(spec)
 		}
 
@@ -488,6 +494,17 @@ func cmdUp() {
 		}
 		fmt.Printf("%d) %s/openapi.json  (config: %s)\n", idx+1, url, filepath.Base(inst.ConfigPath))
 		fmt.Printf("   X-API-Key: %s\n", inst.APIKey)
+
+		// NEW: quick counts + warning near/over 30
+		warn := ""
+		switch {
+		case inst.OperationCount > 30:
+			warn = "  ⚠ OVER 30‑limit"
+		case inst.OperationCount >= 28:
+			warn = "  ⚠ near 30"
+		}
+		fmt.Printf("   MCP servers: %d\n", len(inst.ToolNames))
+		fmt.Printf("   Endpoints (OpenAPI operations): %d%s\n", inst.OperationCount, warn)
 	}
 	fmt.Println()
 
@@ -576,7 +593,18 @@ func cmdStatus() {
 		fmt.Printf("    mcpo:  http://127.0.0.1:%d\n", inst.McpoPort)
 		fmt.Printf("    Tunnel: %s\n", inst.TunnelMode)
 		if len(inst.ToolNames) > 0 {
-			fmt.Printf("    Tools: %s\n", strings.Join(inst.ToolNames, ", "))
+			fmt.Printf("    MCP servers: %d\n", len(inst.ToolNames))
+		}
+		// Show operation count + warning
+		warn := ""
+		switch {
+		case inst.OperationCount > 30:
+			warn = "  ⚠ OVER 30‑limit"
+		case inst.OperationCount >= 28:
+			warn = "  ⚠ near 30"
+		}
+		if inst.OperationCount > 0 {
+			fmt.Printf("    Endpoints (OpenAPI operations): %d%s\n", inst.OperationCount, warn)
 		}
 		fmt.Printf("    X-API-Key: %s\n", inst.APIKey)
 	}
@@ -1062,6 +1090,7 @@ func mergeOpenAPI(inst Instance, baseURL string) ([]byte, error) {
 				}
 			}
 		}
+		// Work on a deep copy so we can mutate $refs safely
 		spec = deepCopy(spec).(map[string]any)
 		rewriteRefs(spec, name, localKeys)
 
@@ -1078,6 +1107,7 @@ func mergeOpenAPI(inst Instance, baseURL string) ([]byte, error) {
 				}
 			}
 		}
+
 		// Merge paths with prefix
 		if p, ok := spec["paths"].(map[string]any); ok {
 			for rawPath, v := range p {
@@ -1102,6 +1132,65 @@ func mergeOpenAPI(inst Instance, baseURL string) ([]byte, error) {
 	}
 	out, _ := json.MarshalIndent(merged, "", "  ")
 	return out, nil
+}
+
+// NEW: recursively rewrite local component $refs to their namespaced form (e.g. Foo → <tool>__Foo).
+func rewriteRefs(node any, prefix string, localKeys map[string]map[string]bool) {
+	switch t := node.(type) {
+	case map[string]any:
+		for k, v := range t {
+			if k == "$ref" {
+				if s, ok := v.(string); ok {
+					const base = "#/components/"
+					if strings.HasPrefix(s, base) {
+						rest := strings.TrimPrefix(s, base) // e.g. "schemas/Foo"
+						parts := strings.Split(rest, "/")
+						if len(parts) >= 2 {
+							section := parts[0]
+							name := parts[len(parts)-1]
+							if localKeys != nil && localKeys[section][name] {
+								parts[len(parts)-1] = prefix + "__" + name
+								t[k] = base + strings.Join(parts, "/")
+							}
+						}
+					}
+				}
+			} else {
+				rewriteRefs(v, prefix, localKeys)
+			}
+		}
+	case []any:
+		for i := range t {
+			rewriteRefs(t[i], prefix, localKeys)
+		}
+	}
+}
+
+// Count total OpenAPI operations under .paths (what GPT Actions treat as “tools”).
+func countOperations(spec []byte) int {
+	var m map[string]any
+	if err := json.Unmarshal(spec, &m); err != nil {
+		return 0
+	}
+	paths, _ := m["paths"].(map[string]any)
+	if paths == nil {
+		return 0
+	}
+	methods := map[string]struct{}{
+		"get": {}, "post": {}, "put": {}, "delete": {}, "patch": {},
+		"options": {}, "head": {}, "trace": {}, "connect": {},
+	}
+	count := 0
+	for _, v := range paths {
+		if mm, ok := v.(map[string]any); ok {
+			for mk := range mm {
+				if _, ok := methods[strings.ToLower(mk)]; ok {
+					count++
+				}
+			}
+		}
+	}
+	return count
 }
 
 func ensureLeadingSlash(s string) string {
