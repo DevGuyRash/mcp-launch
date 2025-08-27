@@ -24,19 +24,17 @@
 
 ## What’s new (this build)
 
-- **Warn on long descriptions:** detects **tool descriptions > 300 chars**, summarized per MCP server (details only with `-v`/`-vv` or in `--log-file`).
-- **Per‑server “30+ tools” warning:** keep your overall count, but now also show a warning **per server** when it exposes 30+ tools.
+- **Warn on long descriptions:** detects **tool descriptions > 300 chars**, summarized **per MCP server** (details only with `-v`/`-vv` or in `--log-file`).
+- **Per‑server “30+ endpoints” warning:** you still get the overall count, and now also a warning **per server** once it exposes 30+ operations.
 - **Optional TUI preflight** (Bubble Tea v1):
-  - Edit **Allowed tools** (multi‑select)
-  - Edit **Disallowed tools** (multi‑select)
+  - Edit **Allowed**/**Disallowed** tools (multi‑select)
   - Edit **Tool descriptions** (`+` sets trimmed ≤300; `-` clears)
   - **Disable/Enable** server
   - Choose **launch mode**:
     - **Via mcpo** (HTTP + OpenAPI; your current flow)
     - **Raw MCP** (stdio only; useful for running servers without mcpo)
 
-> The TUI inspects tools via MCP’s standard `initialize` → `tools/list` flow over **stdio**; we don’t reinvent discovery. (Docs: MCP tools/list & architecture.)  
-> It then clones your configs to `.mcp-launch/tmp/<name>/mcp.config.json` and applies only safe edits (disabling servers) to the clones; description/allow/deny overrides are applied during merge when launching via `mcpo`.  
+The TUI inspects tools via MCP’s standard `initialize` → `tools/list` on **stdio**; we don’t reinvent discovery. It clones your configs to `.mcp-launch/tmp/<name>/mcp.config.json` and applies only safe edits (disabling servers) to the clones; description/allow/deny overrides are applied during merge when launching via `mcpo`.
 
 ---
 
@@ -153,7 +151,7 @@ Stop with **Ctrl‑C** (tears down mcpo, spawned MCP servers, the proxy, and clo
 
 ### Output behavior
 
-- **Default:** minimal summary + per‑server one‑liners (if any tool has `description > 300` and/or tool count ≥ 30).  
+- **Default:** minimal summary + per‑server one‑liners (if any operation has `description > 300` and/or endpoints ≥ 30).  
   Add `-v`/`-vv` (or `--log-file`) to see **each** offending operation with method/path/tool/length.
 
 ---
