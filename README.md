@@ -1,11 +1,23 @@
 # mcp-launch — one URL for many MCP servers (via **mcpo**)
 
-`mcp-launch` is a tiny, cross‑platform CLI that:
+> **Project scope & credits**  
+> `mcp-launch` is a thin **wrapper** around existing, excellent projects:
+>
+> - **[`mcpo`](https://github.com/open-webui/mcpo)** — turns MCP servers into HTTP/OpenAPI with per‑tool routes and docs.
+> - **MCP servers** such as **[`Serena`](https://github.com/oraios/serena)**.
+> - **Cloudflare Tunnel** — to expose a stable public HTTPS URL without port‑forwarding.
+>
+> This tool simply **supervises processes**, **merges per‑tool OpenAPI specs** into a single `/openapi.json`, and prints the **one URL** to paste into a Custom GPT.  
+> It does **not** reimplement MCP or `mcpo`, and it aims to stay minimal and maintainable.
+>
+> _Not affiliated with or endorsed by OraiOS/Serena, Open WebUI/mcpo, Cloudflare, or OpenAI. All trademarks belong to their respective owners._
 
-- launches **mcpo** as the single HTTP front door for one or more **MCP** servers,
-- serves a **single merged OpenAPI** at `/openapi.json`,
-- optionally exposes everything via **Cloudflare Tunnel** (Quick or Named),
-- prints the **one URL** you paste into a **Custom GPT** (Actions → Import from URL).
+`mcp-launch` is a **small wrapper** that:
+
+- Starts **mcpo** as a single front door for one or more **MCP** servers
+- Optionally publishes it via **Cloudflare Tunnel**
+- Generates a **single merged OpenAPI** spec that you can import into a **Custom GPT** as Actions
+- Exposes `/openapi.json` on the same public URL as your API routes
 
 **No wheel‑reinventing.** `mcpo` already supports multi‑server configs and per‑tool OpenAPI + docs; we just supervise it, merge the specs, and publish the result.
 
@@ -26,6 +38,7 @@
   - [Security notes](#security-notes)
   - [Troubleshooting](#troubleshooting)
   - [FAQ](#faq)
+  - [Credits \& thanks](#credits--thanks)
   - [License](#license)
 
 ---
@@ -306,6 +319,17 @@ A: No. The front proxy serves `/openapi.json` and proxies the rest on the same p
 
 **Q: Where is state stored?**
 A: `./.mcp-launch/state.json` (ports, API key, public URL, PIDs).
+
+---
+
+## Credits & thanks
+
+- **[`mcpo`](https://github.com/open-webui/mcpo)** by the Open WebUI community for the MCP→OpenAPI gateway, multi‑server config, hot‑reload, and per‑tool docs.
+- **[`Serena`](https://github.com/oraios/serena)** (and the broader MCP ecosystem) for robust servers and great examples.
+- **Cloudflare Tunnel** for simple, reliable public URLs to local services.
+- **Custom GPT Actions** for making OpenAPI‑described tools easy to wire into ChatGPT.
+
+If you encounter issues that are clearly upstream (e.g., a server’s schema or behavior), please consider filing them with the respective project to benefit everyone. This wrapper intentionally **avoids reinventing wheels**; when upstream adds new capabilities (e.g., unified specs), we’ll remove code rather than duplicate it.
 
 ---
 
