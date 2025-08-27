@@ -12,6 +12,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -28,7 +29,7 @@ import (
 	"time"
 )
 
-const Version = "0.4.0"
+const Version = "0.4.2"
 
 const (
 	defaultFrontPort = 8000
@@ -47,6 +48,7 @@ type MCPServer struct {
 	URL     string            `json:"url,omitempty"`  // for sse/streamable-http
 	Headers map[string]string `json:"headers,omitempty"`
 }
+
 type MCPConfig struct {
 	MCPServers map[string]MCPServer `json:"mcpServers"`
 }
@@ -65,8 +67,7 @@ type Instance struct {
 	CloudflaredPID int      `json:"cloudflared_pid"`
 	McpoPID        int      `json:"mcpo_pid"`
 	ToolNames      []string `json:"tool_names"`
-	// NEW: number of OpenAPI operations (the “tools” that count toward the ~30 limit)
-	OperationCount int `json:"operation_count"`
+	OperationCount int      `json:"operation_count"` // total OpenAPI operations after merge
 }
 
 type State struct {
@@ -84,8 +85,7 @@ type State struct {
 
 	// Multi-instance (preferred)
 	Instances []Instance `json:"instances"`
-
-	StartedAt string `json:"started_at"`
+	StartedAt string     `json:"started_at"`
 }
 
 // ---------- CLI ----------
@@ -164,7 +164,7 @@ DESCRIPTION
 OPTIONS
   --config PATH          Repeatable. Claude-style config(s). Default: mcp.config.json if omitted.
   --port N               Base front proxy port (default: 8000). Subsequent stacks use N+1, N+2, ...
-  --mcpo-port N          Base mcpo port (default: 8800). Subsequent stacks use N+1, N+2, ...
+  --mcpo-port N          Base internal mcpo port (default: 8800). Subsequent stacks use N+1, N+2, ...
   --api-key KEY          API key. With --shared-key this is used for all stacks; otherwise keys are generated per stack.
   --shared-key           Use a single API key for all stacks (safer default is per-stack keys).
   --tunnel MODE          quick | named | none (default: quick)
@@ -196,6 +196,7 @@ EXAMPLES
 	case "openapi":
 		fmt.Println(`USAGE
   mcp-launch openapi [--public-url URL ...]
+
 DESCRIPTION
   Rebuild the merged OpenAPI document for each running stack from its per-tool specs,
   and set servers[0].url to the provided --public-url(s) (one per stack or one for all)
@@ -291,22 +292,6 @@ func (s *stringSlice) Set(v string) error {
 	return nil
 }
 
-// Reserve an actually-free TCP port >= start that hasn't already been picked
-// for another stack in this run.
-func reservePort(start int, taken map[int]bool) int {
-	p := start
-	for tries := 0; tries < 4096; tries++ {
-		if !taken[p] && isFree(p) {
-			taken[p] = true
-			return p
-		}
-		p++
-	}
-	// Fallback: mark start as taken; Serve() would fail and we will log it.
-	taken[start] = true
-	return start
-}
-
 func cmdUp() {
 	fs := flag.NewFlagSet("up", flag.ExitOnError)
 	fs.Usage = func() { helpTopic("up") }
@@ -340,6 +325,7 @@ func cmdUp() {
 	} else if *verbose {
 		verbosity = 1
 	}
+
 	streamProcs := *stream || *verbose || *debug
 
 	// Open log file (optional)
@@ -367,19 +353,14 @@ func cmdUp() {
 		st.APIKey = shared
 	}
 
-	// Build instance plans
+	// Build instance plans (reserve unique ports per stack)
 	instances := make([]Instance, 0, len(configs))
-	// NEW: track ports we reserve during planning so stacks don't collide
 	takenFront := map[int]bool{}
 	takenMcpo := map[int]bool{}
-
 	for i, cfgPath := range configs {
 		name := nameFromPath(cfgPath, i)
-
-		// NEW: choose unique, actually-free ports per stack
 		front := reservePort(*port+i, takenFront)
 		mcpoP := reservePort(*mcpoPort+i, takenMcpo)
-
 		inst := Instance{
 			Name:       name,
 			ConfigPath: cfgPath,
@@ -407,7 +388,7 @@ func cmdUp() {
 		inst   *Instance
 		proxy  *frontProxy
 		mcpo   *exec.Cmd
-		tunnel *exec.Cmd // not needed for kill (we store PID in state), but kept for parity
+		tunnel *exec.Cmd
 	}
 	runs := make([]*running, 0, len(instances))
 
@@ -439,7 +420,7 @@ func cmdUp() {
 
 		waitURL(fmt.Sprintf("http://127.0.0.1:%d/docs", inst.McpoPort), 60*time.Second)
 
-		// Tools
+		// Record MCP server names from config
 		cfg := readConfig(inst.ConfigPath)
 		var toolNames []string
 		for name := range cfg.MCPServers {
@@ -460,7 +441,7 @@ func cmdUp() {
 			fmt.Printf("[front#%s] http://127.0.0.1:%d\n", inst.Name, inst.FrontPort)
 		}
 
-		// Cloudflare
+		// Cloudflare tunnel
 		switch inst.TunnelMode {
 		case "quick":
 			u := startQuickTunnel("cloudflared#"+inst.Name, inst.FrontPort, streamProcs, lf)
@@ -494,13 +475,24 @@ func cmdUp() {
 		if err != nil {
 			fmt.Printf("[openapi#%s] merge failed: %v\n", inst.Name, err)
 		} else {
-			// Count operations (“tools” in GPT Actions)
 			inst.OperationCount = countOperations(spec)
 			saveStateMulti(&st, instances)
-
+			// quick sanity check: any dangling component refs?
+			if warns := findDanglingComponentRefs(spec); len(warns) > 0 {
+				fmt.Printf("[openapi#%s] WARNING: unresolved $ref targets detected:\n", inst.Name)
+				max := warns
+				if len(max) > 8 {
+					max = max[:8]
+				}
+				for _, w := range max {
+					fmt.Println("  -", w)
+				}
+				if len(warns) > len(max) {
+					fmt.Printf("  … and %d more\n", len(warns)-len(max))
+				}
+			}
 			proxy.SetOpenAPI(spec)
 		}
-
 		runs = append(runs, &running{inst: inst, proxy: proxy, mcpo: mcpoCmd})
 	}
 
@@ -519,12 +511,10 @@ func cmdUp() {
 		}
 		fmt.Printf("%d) %s/openapi.json  (config: %s)\n", idx+1, url, filepath.Base(inst.ConfigPath))
 		fmt.Printf("   X-API-Key: %s\n", inst.APIKey)
-
-		// NEW: quick counts + warning near/over 30
 		warn := ""
 		switch {
 		case inst.OperationCount > 30:
-			warn = "  ⚠ OVER 30‑limit"
+			warn = "  ⚠ OVER 30-limit"
 		case inst.OperationCount >= 28:
 			warn = "  ⚠ near 30"
 		}
@@ -573,14 +563,10 @@ func cmdUp() {
 
 	select {
 	case <-sigCh:
-		if verbosity > 0 {
-			fmt.Println("\nReceived signal, shutting down…")
-		}
+		fmt.Println("\nReceived signal, shutting down…")
 		cleanup()
 	case name := <-doneCh:
-		if verbosity > 0 {
-			fmt.Println("\nmcpo exited for stack:", name)
-		}
+		fmt.Println("\nmcpo exited for stack:", name)
 		cleanup()
 	}
 }
@@ -620,11 +606,10 @@ func cmdStatus() {
 		if len(inst.ToolNames) > 0 {
 			fmt.Printf("    MCP servers: %d\n", len(inst.ToolNames))
 		}
-		// Show operation count + warning
 		warn := ""
 		switch {
 		case inst.OperationCount > 30:
-			warn = "  ⚠ OVER 30‑limit"
+			warn = "  ⚠ OVER 30-limit"
 		case inst.OperationCount >= 28:
 			warn = "  ⚠ near 30"
 		}
@@ -700,6 +685,7 @@ func cmdOpenAPI() {
 		fmt.Println("No running stacks found in state.")
 		return
 	}
+
 	for i := range st.Instances {
 		inst := &st.Instances[i]
 		baseURL := inst.PublicURL
@@ -715,6 +701,13 @@ func cmdOpenAPI() {
 		if err != nil {
 			fmt.Printf("[openapi#%s] merge failed: %v\n", inst.Name, err)
 			continue
+		}
+		// warn if dangling refs
+		if warns := findDanglingComponentRefs(spec); len(warns) > 0 {
+			fmt.Printf("[openapi#%s] WARNING: unresolved $ref targets detected:\n", inst.Name)
+			for _, w := range warns {
+				fmt.Println("  -", w)
+			}
 		}
 		out := filepath.Join(getStateDir(), fmt.Sprintf("openapi_%s.json", inst.Name))
 		_ = os.WriteFile(out, spec, 0644)
@@ -740,6 +733,7 @@ func ensureStateDir() string {
 	_ = os.MkdirAll(dir, 0o755)
 	return dir
 }
+
 func getStateDir() string { return filepath.Join(".", stateDirName) }
 func statePath() string   { return filepath.Join(getStateDir(), stateFileName) }
 
@@ -748,6 +742,7 @@ func saveState(st *State) {
 	data, _ := json.MarshalIndent(st, "", "  ")
 	_ = os.WriteFile(statePath(), data, 0644)
 }
+
 func saveStateMulti(st *State, instances []Instance) {
 	st.Instances = instances
 	saveState(st)
@@ -844,6 +839,21 @@ func pickPort(preferred int) int {
 	}
 	return preferred
 }
+
+// Reserve an actually-free TCP port >= start that hasn't already been picked for another stack in this run.
+func reservePort(start int, taken map[int]bool) int {
+	p := start
+	for tries := 0; tries < 4096; tries++ {
+		if !taken[p] && isFree(p) {
+			taken[p] = true
+			return p
+		}
+		p++
+	}
+	taken[start] = true
+	return start
+}
+
 func isFree(port int) bool {
 	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
@@ -864,6 +874,7 @@ func newFrontProxy(frontPort, mcpoPort int) *frontProxy {
 	target, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", mcpoPort))
 	p := httputil.NewSingleHostReverseProxy(target)
 	fp := &frontProxy{proxy: p}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/openapi.json", func(w http.ResponseWriter, r *http.Request) {
 		fp.mu.RLock()
@@ -882,18 +893,22 @@ func newFrontProxy(frontPort, mcpoPort int) *frontProxy {
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		p.ServeHTTP(w, r)
 	})
+
 	fp.srv = &http.Server{
 		Addr:    fmt.Sprintf(":%d", frontPort),
 		Handler: mux,
 	}
 	return fp
 }
+
 func (f *frontProxy) Serve() error { return f.srv.ListenAndServe() }
+
 func (f *frontProxy) SetOpenAPI(spec []byte) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.spec = spec
 }
+
 func (f *frontProxy) Close(ctx context.Context) error { return f.srv.Shutdown(ctx) }
 
 func startQuickTunnel(tag string, frontPort int, stream bool, logFile *os.File) string {
@@ -907,7 +922,6 @@ func startQuickTunnel(tag string, frontPort int, stream bool, logFile *os.File) 
 	}
 	// save PID
 	st := loadState()
-	// best-effort: find matching instance by frontPort and set PID
 	for i := range st.Instances {
 		if st.Instances[i].FrontPort == frontPort {
 			st.Instances[i].CloudflaredPID = cmd.Process.Pid
@@ -951,7 +965,6 @@ func startNamedTunnel(tag, name string, stream bool, logFile *os.File) {
 
 	// save PID
 	st := loadState()
-	// no solid way to map to instance here; keep as best-effort: assign to first with empty PID
 	for i := range st.Instances {
 		if st.Instances[i].CloudflaredPID == 0 {
 			st.Instances[i].CloudflaredPID = cmd.Process.Pid
@@ -1047,6 +1060,7 @@ func mergeOpenAPI(inst Instance, baseURL string) ([]byte, error) {
 	if len(cfg.MCPServers) == 0 {
 		return nil, fmt.Errorf("no mcpServers in %s", inst.ConfigPath)
 	}
+
 	merged := map[string]any{
 		"openapi": "3.1.0",
 		"info": map[string]any{
@@ -1074,6 +1088,7 @@ func mergeOpenAPI(inst Instance, baseURL string) ([]byte, error) {
 		},
 		"paths": map[string]any{},
 	}
+
 	pathsOut := merged["paths"].(map[string]any)
 	comp := merged["components"].(map[string]any)
 
@@ -1083,6 +1098,7 @@ func mergeOpenAPI(inst Instance, baseURL string) ([]byte, error) {
 		names = append(names, name)
 	}
 	slices.Sort(names)
+
 	client := &http.Client{Timeout: 30 * time.Second}
 	for _, name := range names {
 		toolURL := fmt.Sprintf("http://127.0.0.1:%d/%s/openapi.json", inst.McpoPort, name)
@@ -1099,27 +1115,31 @@ func mergeOpenAPI(inst Instance, baseURL string) ([]byte, error) {
 		if resp.StatusCode != 200 {
 			return nil, fmt.Errorf("fetch %s: status %s\n%s", toolURL, resp.Status, string(body))
 		}
+
 		var spec map[string]any
 		if err := json.Unmarshal(body, &spec); err != nil {
 			return nil, fmt.Errorf("parse %s: %w", toolURL, err)
 		}
-		// Prefix $refs for components we are going to rename
-		localComp, _ := spec["components"].(map[string]any)
+
+		// Collect local component keys from the ORIGINAL to know which refs are local.
+		origComp, _ := spec["components"].(map[string]any)
 		sections := []string{"schemas", "parameters", "responses", "requestBodies"}
 		localKeys := map[string]map[string]bool{}
 		for _, sec := range sections {
 			localKeys[sec] = map[string]bool{}
-			if m, ok := localComp[sec].(map[string]any); ok {
+			if m, ok := origComp[sec].(map[string]any); ok {
 				for k := range m {
 					localKeys[sec][k] = true
 				}
 			}
 		}
-		// Work on a deep copy so we can mutate $refs safely
+
+		// Work on a deep copy and rewrite all $refs to namespaced form BEFORE moving anything.
 		spec = deepCopy(spec).(map[string]any)
 		rewriteRefs(spec, name, localKeys)
 
-		// Move and rename components
+		// Move components from the rewritten copy (so nested $refs stay namespaced).
+		localComp, _ := spec["components"].(map[string]any)
 		if localComp != nil {
 			for _, sec := range sections {
 				src, _ := localComp[sec].(map[string]any)
@@ -1133,11 +1153,10 @@ func mergeOpenAPI(inst Instance, baseURL string) ([]byte, error) {
 			}
 		}
 
-		// Merge paths with prefix
+		// Merge paths with prefix; remove per-op security (rely on top-level).
 		if p, ok := spec["paths"].(map[string]any); ok {
 			for rawPath, v := range p {
 				newPath := "/" + strings.TrimLeft(name, "/") + ensureLeadingSlash(rawPath)
-				// Namespace operationIds
 				if m, ok := v.(map[string]any); ok {
 					for method, op := range m {
 						om, ok := op.(map[string]any)
@@ -1149,49 +1168,67 @@ func mergeOpenAPI(inst Instance, baseURL string) ([]byte, error) {
 						} else {
 							om["operationId"] = name + "__" + strings.ToLower(method) + "_" + sanitizeForID(rawPath)
 						}
+						// Cleanup: remove any per-operation security (duplicate of top-level).
+						delete(om, "security")
 					}
 				}
 				pathsOut[newPath] = v
 			}
 		}
 	}
+
+	// Global cleanups:
+	//  - tighten empty response schemas
+	//  - coerce obvious integer-like number types
+	if paths, ok := merged["paths"].(map[string]any); ok {
+		tightenResponses(paths)
+	}
+	coerceIntegerTypes(merged)
+
 	out, _ := json.MarshalIndent(merged, "", "  ")
 	return out, nil
 }
 
-// NEW: recursively rewrite local component $refs to their namespaced form (e.g. Foo → <tool>__Foo).
-func rewriteRefs(node any, prefix string, localKeys map[string]map[string]bool) {
-	switch t := node.(type) {
+// rewriteRefs recursively rewrites local component $refs to namespaced form "<tool>__Name".
+func rewriteRefs(v any, tool string, localKeys map[string]map[string]bool) {
+	switch node := v.(type) {
 	case map[string]any:
-		for k, v := range t {
-			if k == "$ref" {
-				if s, ok := v.(string); ok {
-					const base = "#/components/"
-					if strings.HasPrefix(s, base) {
-						rest := strings.TrimPrefix(s, base) // e.g. "schemas/Foo"
-						parts := strings.Split(rest, "/")
-						if len(parts) >= 2 {
-							section := parts[0]
-							name := parts[len(parts)-1]
-							if localKeys != nil && localKeys[section][name] {
-								parts[len(parts)-1] = prefix + "__" + name
-								t[k] = base + strings.Join(parts, "/")
-							}
-						}
-					}
-				}
-			} else {
-				rewriteRefs(v, prefix, localKeys)
+		if ref, ok := node["$ref"].(string); ok {
+			if newRef := rewriteRefString(ref, tool, localKeys); newRef != ref {
+				node["$ref"] = newRef
 			}
 		}
+		for k, child := range node {
+			if k == "$ref" {
+				continue
+			}
+			rewriteRefs(child, tool, localKeys)
+		}
 	case []any:
-		for i := range t {
-			rewriteRefs(t[i], prefix, localKeys)
+		for i := range node {
+			rewriteRefs(node[i], tool, localKeys)
 		}
 	}
 }
 
-// Count total OpenAPI operations under .paths (what GPT Actions treat as “tools”).
+func rewriteRefString(ref, tool string, localKeys map[string]map[string]bool) string {
+	const base = "#/components/"
+	if !strings.HasPrefix(ref, base) {
+		return ref
+	}
+	rest := strings.TrimPrefix(ref, base) // e.g., "schemas/ValidationError"
+	parts := strings.SplitN(rest, "/", 2)
+	if len(parts) != 2 {
+		return ref
+	}
+	section, name := parts[0], parts[1]
+	if secs, ok := localKeys[section]; ok && secs[name] {
+		return base + section + "/" + tool + "__" + name
+	}
+	return ref
+}
+
+// Count total OpenAPI operations under .paths
 func countOperations(spec []byte) int {
 	var m map[string]any
 	if err := json.Unmarshal(spec, &m); err != nil {
@@ -1218,6 +1255,64 @@ func countOperations(spec []byte) int {
 	return count
 }
 
+// Find unresolved component $ref targets for quick diagnostics.
+func findDanglingComponentRefs(spec []byte) []string {
+	var m map[string]any
+	if err := json.Unmarshal(spec, &m); err != nil {
+		return nil
+	}
+	comp, _ := m["components"].(map[string]any)
+	if comp == nil {
+		return nil
+	}
+	sections := []string{"schemas", "parameters", "responses", "requestBodies"}
+	have := map[string]map[string]bool{}
+	for _, sec := range sections {
+		have[sec] = map[string]bool{}
+		if mm, ok := comp[sec].(map[string]any); ok {
+			for k := range mm {
+				have[sec][k] = true
+			}
+		}
+	}
+	var warns []string
+	seen := map[string]bool{}
+	var walk func(any)
+	walk = func(v any) {
+		switch n := v.(type) {
+		case map[string]any:
+			if ref, ok := n["$ref"].(string); ok && strings.HasPrefix(ref, "#/components/") {
+				rest := strings.TrimPrefix(ref, "#/components/")
+				parts := strings.SplitN(rest, "/", 2)
+				if len(parts) == 2 {
+					sec, name := parts[0], parts[1]
+					if sect, ok := have[sec]; ok {
+						if !sect[name] {
+							msg := fmt.Sprintf("%s not found (section=%s)", ref, sec)
+							if !seen[msg] {
+								seen[msg] = true
+								warns = append(warns, msg)
+							}
+						}
+					}
+				}
+			}
+			for k, child := range n {
+				if k == "$ref" {
+					continue
+				}
+				walk(child)
+			}
+		case []any:
+			for i := range n {
+				walk(n[i])
+			}
+		}
+	}
+	walk(m)
+	return warns
+}
+
 func ensureLeadingSlash(s string) string {
 	if s == "" {
 		return "/"
@@ -1227,6 +1322,7 @@ func ensureLeadingSlash(s string) string {
 	}
 	return s
 }
+
 func sanitizeForID(p string) string {
 	var b strings.Builder
 	for _, r := range p {
@@ -1238,9 +1334,185 @@ func sanitizeForID(p string) string {
 	}
 	return b.String()
 }
+
 func deepCopy(v any) any {
 	b, _ := json.Marshal(v)
 	var out any
 	_ = json.Unmarshal(b, &out)
 	return out
+}
+
+// ---------- OpenAPI Cleanups (agnostic) ----------
+
+// tightenResponses removes empty schemas ({}), collapses anyOf that include {},
+// and deletes empty content blocks. It does not change status codes.
+func tightenResponses(paths map[string]any) {
+	for _, v := range paths {
+		ops, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
+		for _, ov := range ops {
+			op, ok := ov.(map[string]any)
+			if !ok {
+				continue
+			}
+			responses, ok := op["responses"].(map[string]any)
+			if !ok {
+				continue
+			}
+			for code, rv := range responses {
+				rmap, ok := rv.(map[string]any)
+				if !ok {
+					continue
+				}
+				// Ensure there's at least a description.
+				if _, ok := rmap["description"]; !ok {
+					rmap["description"] = "Successful Response"
+				}
+				content, ok := rmap["content"].(map[string]any)
+				if !ok || len(content) == 0 {
+					responses[code] = rmap
+					continue
+				}
+				for ctype, cv := range content {
+					cm, ok := cv.(map[string]any)
+					if !ok {
+						continue
+					}
+					if schema, ok := cm["schema"]; ok {
+						clean := cleanupSchemaNode(schema)
+						if clean == nil {
+							// remove this media type entirely
+							delete(content, ctype)
+						} else {
+							cm["schema"] = clean
+						}
+					}
+				}
+				if len(content) == 0 {
+					delete(rmap, "content")
+				}
+				responses[code] = rmap
+			}
+		}
+	}
+}
+
+// cleanupSchemaNode returns a cleaned schema node or nil if it becomes empty.
+func cleanupSchemaNode(schema any) any {
+	switch n := schema.(type) {
+	case map[string]any:
+		// Empty object {} → nil
+		if len(n) == 0 {
+			return nil
+		}
+		// anyOf with {} entries → drop empty ones; collapse to single if only one remains
+		if anyOf, ok := n["anyOf"].([]any); ok {
+			filtered := make([]any, 0, len(anyOf))
+			for _, it := range anyOf {
+				if mm, ok := it.(map[string]any); ok && len(mm) == 0 {
+					continue
+				}
+				filtered = append(filtered, it)
+			}
+			if len(filtered) == 0 {
+				return nil
+			}
+			if len(filtered) == 1 {
+				return filtered[0]
+			}
+			n["anyOf"] = filtered
+			return n
+		}
+		// Recurse into children
+		for k, v := range n {
+			if k == "$ref" {
+				continue
+			}
+			if cleaned := cleanupSchemaNode(v); cleaned == nil {
+				// If a child becomes nil and was a compositional key, handle lightly; otherwise keep structure.
+				// We won't remove arbitrary keys to avoid over-aggressive pruning.
+			} else {
+				n[k] = cleaned
+			}
+		}
+		return n
+	case []any:
+		out := make([]any, 0, len(n))
+		for _, it := range n {
+			if cleaned := cleanupSchemaNode(it); cleaned != nil {
+				out = append(out, cleaned)
+			}
+		}
+		if len(out) == 0 {
+			return nil
+		}
+		return out
+	default:
+		return n
+	}
+}
+
+// coerceIntegerTypes walks the entire document and converts obvious integer-like
+// schemas from "number" → "integer" when safe (integral default/enum/multipleOf).
+func coerceIntegerTypes(root any) {
+	switch node := root.(type) {
+	case map[string]any:
+		// Detect and coerce this schema if applicable.
+		if t, ok := node["type"].(string); ok && t == "number" {
+			if shouldBeInteger(node) {
+				node["type"] = "integer"
+				// intentionally no format guess (keeps it generic)
+			}
+		}
+		for k, v := range node {
+			if k == "$ref" {
+				continue
+			}
+			coerceIntegerTypes(v)
+		}
+	case []any:
+		for i := range node {
+			coerceIntegerTypes(node[i])
+		}
+	}
+}
+
+func shouldBeInteger(schema map[string]any) bool {
+	// default integral?
+	if dv, ok := schema["default"]; ok {
+		if isIntegralNumber(dv) {
+			return true
+		}
+	}
+	// enum all integral?
+	if ev, ok := schema["enum"].([]any); ok && len(ev) > 0 {
+		allInt := true
+		for _, e := range ev {
+			if !isIntegralNumber(e) {
+				allInt = false
+				break
+			}
+		}
+		if allInt {
+			return true
+		}
+	}
+	// multipleOf integral?
+	if mv, ok := schema["multipleOf"]; ok && isIntegralNumber(mv) {
+		return true
+	}
+	return false
+}
+
+func isIntegralNumber(v any) bool {
+	switch n := v.(type) {
+	case float64:
+		return math.Trunc(n) == n
+	case int, int32, int64:
+		return true
+	default:
+		return false
+	}
 }
