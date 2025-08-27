@@ -3,8 +3,7 @@ package merger
 import (
     "encoding/json"
     "fmt"
-    "maps"
-    "slices"
+    "sort"
 )
 
 // Merge multiple OpenAPI JSON documents (as raw bytes), prefixing paths by server name,
@@ -31,7 +30,11 @@ func Merge(serverToSpec map[string][]byte) ([]byte, error) {
         "type": "apiKey", "in": "header", "name": "X-API-Key",
     }
 
-    ordered := slices.Sorted(maps.Keys(serverToSpec))
+    ordered := make([]string, 0, len(serverToSpec))
+    for k := range serverToSpec {
+        ordered = append(ordered, k)
+    }
+    sort.Strings(ordered)
     for _, name := range ordered {
         raw := serverToSpec[name]
         var spec map[string]any

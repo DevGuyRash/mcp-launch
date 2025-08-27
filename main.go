@@ -22,6 +22,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"runtime"
 	"slices"
 	"strings"
@@ -614,7 +615,8 @@ func cmdUp() {
 		fmt.Printf("   Endpoints (OpenAPI operations): %d%s\n", inst.OperationCount, warn)
 		// Per-server tool count + long description warning (summary only)
 		if len(inst.ServerOpCounts) > 0 {
-			names := slices.Sorted(mapsKeys(inst.ServerOpCounts))
+			names := mapsKeys(inst.ServerOpCounts)
+			sort.Strings(names)
 			for _, sname := range names {
 				count := inst.ServerOpCounts[sname]
 				sWarn := ""
@@ -646,7 +648,8 @@ func cmdUp() {
 				continue
 			}
 			fmt.Printf("[details#%s] Tools with descriptions > %d chars:\n", inst.Name, descLimit)
-			names := slices.Sorted(mapsKeys(inst.ServerWarns))
+			names := mapsKeys(inst.ServerWarns)
+			sort.Strings(names)
 			for _, sname := range names {
 				warns := inst.ServerWarns[sname]
 				if len(warns) == 0 { continue }
@@ -1415,7 +1418,10 @@ func mergeOpenAPI(inst Instance, baseURL string, ov *Overlay) ([]byte, map[strin
 					}
 				}
 				pathsOut[newPath] = v
-				perServerCounts[name] += countHTTPMethods(m)
+				// Count HTTP methods for this path item safely
+				if mm, ok2 := v.(map[string]any); ok2 {
+					perServerCounts[name] += countHTTPMethods(mm)
+				}
 			}
 		}
 	}
