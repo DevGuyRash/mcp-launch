@@ -10,5 +10,9 @@ bin/
 .mcp-launch/
 mcp-launch
 
+# logs
+*.log
+.mcp-launch/*.log
+
 # misc
 *repomix*

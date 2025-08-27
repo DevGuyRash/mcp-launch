@@ -1,4 +1,4 @@
-# mcp-launch — one URL for many MCP servers (via **mcpo**)
+# mcp-launch — one URL per config for many MCP servers (via **mcpo**)
 
 > **Project scope & credits**  
 > `mcp-launch` is a thin **wrapper** around existing, excellent projects:
@@ -7,119 +7,79 @@
 > - **MCP servers** such as **[`Serena`](https://github.com/oraios/serena)**.
 > - **Cloudflare Tunnel** — to expose a stable public HTTPS URL without port‑forwarding.
 >
-> This tool simply **supervises processes**, **merges per‑tool OpenAPI specs** into a single `/openapi.json`, and prints the **one URL** to paste into a Custom GPT.  
+> This tool simply **supervises processes**, **merges per‑tool OpenAPI specs** into a single `/openapi.json` **per stack**, and prints the URL(s) to paste into a Custom GPT.  
 > It does **not** reimplement MCP or `mcpo`, and it aims to stay minimal and maintainable.
 >
 > _Not affiliated with or endorsed by OraiOS/Serena, Open WebUI/mcpo, Cloudflare, or OpenAI. All trademarks belong to their respective owners._
 
-`mcp-launch` is a **small wrapper** that:
+`mcp-launch`:
+- Starts **mcpo** as a front door for one or more **MCP** servers
+- Optionally publishes each stack via **Cloudflare Tunnel**
+- Generates a **merged OpenAPI** per stack for a **Custom GPT** Action
+- Exposes `/openapi.json` on the same public URL as the API routes per stack
 
-- Starts **mcpo** as a single front door for one or more **MCP** servers
-- Optionally publishes it via **Cloudflare Tunnel**
-- Generates a **single merged OpenAPI** spec that you can import into a **Custom GPT** as Actions
-- Exposes `/openapi.json` on the same public URL as your API routes
-
-**No wheel‑reinventing.** `mcpo` already supports multi‑server configs and per‑tool OpenAPI + docs; we just supervise it, merge the specs, and publish the result.
+**No wheel‑reinventing.** `mcpo` already supports multi‑server configs and per‑tool OpenAPI + docs; we supervise it, merge the specs, and publish the result.
 
 ---
 
-## Table of contents
+## Why multi‑config? (OpenAI ~30 tools per Action)
 
-- [mcp-launch — one URL for many MCP servers (via **mcpo**)](#mcp-launch--one-url-for-many-mcp-servers-via-mcpo)
-  - [Table of contents](#table-of-contents)
-  - [How it works](#how-it-works)
-  - [Prerequisites](#prerequisites)
-  - [Install / Build](#install--build)
-  - [Quick start (dev)](#quick-start-dev)
-  - [Stable setup (prod)](#stable-setup-prod)
-  - [Add to a Custom GPT](#add-to-a-custom-gpt)
-  - [Command reference](#command-reference)
-  - [Configuration reference (`mcp.config.json`)](#configuration-reference-mcpconfigjson)
-  - [Security notes](#security-notes)
-  - [Troubleshooting](#troubleshooting)
-  - [FAQ](#faq)
-  - [Credits \& thanks](#credits--thanks)
-  - [License](#license)
+Custom GPT Actions currently handle roughly **30 tools**. If your MCP servers exceed that, **split** them across multiple config files. `mcp-launch` can boot **multiple stacks** at once (one per config), each with its own `/openapi.json` and API key, so you can import them into **separate GPTs/chats**.
+
+Examples:
+
+```bash
+# Two stacks via Quick Tunnels (independent URLs + keys):
+mcp-launch up \
+  --config code.json \
+  --config data.json \
+  --tunnel quick
+
+# Two named stacks with stable hosts and a single shared API key:
+mcp-launch up \
+  --config code.json --public-url https://gpt-code.example.com \
+  --config data.json --public-url https://gpt-data.example.com \
+  --tunnel named --tunnel-name my-tunnel \
+  --api-key SECRET --shared-key
+```
 
 ---
 
 ## How it works
 
 ```text
-How it works
-
                  spawns/loads (stdio/SSE/HTTP)             HTTP (OpenAPI + tools)
 +------------+  --------------------------------------->   +-------------+
 | mcp-launch |                                             |  mcpo :8800 |
 +------------+                                             +-------------+
       |
-      | front proxy :8000
-      |   - serves /openapi.json
-      |   - proxies everything else to mcpo
+      | front proxy :8000.. :8000+N-1
+      |   - serves /openapi.json (per stack)
+      |   - proxies everything else to that stack's mcpo
       v
-+-------------+            public HTTPS
-| cloudflared | ---------------------------------------> https://your-host
-+-------------+
-
-mcpo connects to MCP servers defined in mcp.config.json:
++-------------+            public HTTPS (per stack)
+| cloudflared | ---------------------------------------> https://host-A
++-------------+                                          https://host-B
+                                                         ...
+mcpo connects to MCP servers defined in each mcp.config.json:
 
 +-------------+   +--------------+   +-----------+    ...
 |  Serena MCP |   |  Filesystem  |   |  Time MCP |
 +-------------+   +--------------+   +-----------+
 ```
 
----
-
-```mermaid
-flowchart LR
-  A[mcp-launch CLI] -- spawn/load --> B[mcpo :8800]
-
-  subgraph FP[front proxy :8000]
-    C[/serves /openapi.json/]
-    C -->|proxy rest| B
-  end
-
-  FP --> D[Cloudflare Tunnel]
-  D --> E["https://your-host"]
-
-  subgraph MCP_Servers[Configured MCP servers]
-    S[Serena MCP]
-    F[Filesystem MCP]
-    T[Time MCP]
-  end
-
-  B --- S
-  B --- F
-  B --- T
-```
-
-- `mcpo` exposes each MCP server at `/<name>` with its own docs at `/<name>/docs`.
-- The front proxy (default `:8000`) **serves `/openapi.json`** (the merged spec) on the **same** host/port it proxies to `mcpo`.
-- With Cloudflare (Quick or Named), you get a public HTTPS URL to share with ChatGPT.
+- `mcpo` exposes each MCP server at `/<name>` with docs at `/<name>/docs`.
+- The front proxy **serves `/openapi.json`** on the **same host/port** it proxies to `mcpo`.
+- With Cloudflare (Quick or Named), you get a public HTTPS URL **per stack** to share with ChatGPT.
 
 ---
 
 ## Prerequisites
 
-- **Go 1.22+** (to build this CLI)
-- **mcpo** (Python; install with pipx or uv)
-- **cloudflared** (for public URL via Cloudflare Tunnel)
+- **Go 1.22+**
+- **mcpo** (Python; `pipx install mcpo` or `uv tool install mcpo`)
+- **cloudflared**
 - Optional: **uv** (`uvx`) and **node** (`npx`) if your MCP servers use them
-
-Suggested installs:
-
-```bash
-# macOS
-brew install go cloudflared uv
-pipx install mcpo
-
-# Ubuntu/Debian
-sudo snap install go --classic || sudo apt-get install -y golang
-curl -fsSL https://pkg.cloudflare.com/cloudflared/install.sh | sudo bash
-pipx install mcpo
-pipx install uv
-sudo apt-get install -y nodejs npm
-```
 
 ---
 
@@ -128,12 +88,7 @@ sudo apt-get install -y nodejs npm
 ```bash
 git clone <your fork> mcp-launch && cd mcp-launch
 go build -o mcp-launch
-```
-
-Windows:
-
-```powershell
-go build -o mcp-launch.exe
+# Windows: go build -o mcp-launch.exe
 ```
 
 ---
@@ -147,14 +102,13 @@ go build -o mcp-launch.exe
 # 2) Bring everything up using an ephemeral Cloudflare Quick Tunnel
 ./mcp-launch up --tunnel quick
 
-# 3) Copy the printed URL ending in /openapi.json
-#    (e.g., https://random.trycloudflare.com/openapi.json)
-#    and the printed API key (also saved in .mcp-launch/state.json; see `mcp-launch status`)
+# 3) Copy the printed URL ending in /openapi.json and the API key
+#    (key is also saved in .mcp-launch/state.json; shown by `mcp-launch status`)
 ```
 
-You can explore per‑tool docs in your browser:
+Per‑tool docs (example):
 
-```bash
+```
 https://<public>/serena/docs
 https://<public>/time/docs
 ...
@@ -172,90 +126,73 @@ Stop with **Ctrl‑C** (tears down mcpo, spawned MCP servers, the proxy, and clo
 
 Use a **Named Tunnel** for a stable domain you own.
 
-1. Create a tunnel + DNS in Cloudflare Zero Trust (map `gpt-tools.example.com`).
-2. Run:
-
 ```bash
 ./mcp-launch up --tunnel named \
   --public-url https://gpt-tools.example.com \
   --tunnel-name <YOUR_TUNNEL_NAME>
 ```
 
-You’ll paste **`https://gpt-tools.example.com/openapi.json`** into ChatGPT once this is up.
-
-> Note: Because the front proxy serves **both** `/openapi.json` and all tool routes on the same port, you don’t need special path ingress. Point the named tunnel host at your front proxy; that’s it.
+Paste **`https://gpt-tools.example.com/openapi.json`** into ChatGPT.
 
 ---
 
 ## Add to a Custom GPT
 
-1. Open ChatGPT → **Create a GPT** → **Configure** → **Actions**.
-2. Choose **Import from URL** and paste the printed schema URL, e.g.:
-
-   ```bash
-   https://gpt-tools.example.com/openapi.json
+1. ChatGPT → **Create a GPT** → **Configure** → **Actions**.
+2. **Import from URL** → paste the schema URL printed by `up`, e.g.:
    ```
+   https://gpt-code.example.com/openapi.json
+   ```
+3. Auth: **API Key** → header **`X-API-Key`** → paste the key printed by `up` (also in `mcp-launch status`).
 
-3. Set **Authentication** to **API Key**, header **`X-API-Key`**.
-4. Paste the same key that `mcp-launch up` printed (also shown by `mcp-launch status`).
-
-That’s all—your GPT now sees _all_ your MCP tools through one Action.
+Repeat for each stack if you split configs.
 
 ---
 
 ## Command reference
 
-Run `mcp-launch help` for a summary, or `mcp-launch help up` for subcommand help.
+- `init` — Scaffold `mcp.config.json` and default state at `./.mcp-launch/state.json`.
 
-**`init`**
-Scaffold `mcp.config.json` and default state at `./.mcp-launch/state.json`.
+- `up` — Start one or more **stacks**: mcpo (default `:8800+i`), front proxy (default `:8000+i`), optional Cloudflare Tunnel, and generate merged OpenAPI.
+  - Options:
+    ```
+    --config PATH        Path to Claude-style config (repeatable)
+    --port N             Base front proxy port (default: 8000)
+    --mcpo-port N        Base mcpo port (default: 8800)
+    --api-key KEY        API key (used for all stacks with --shared-key)
+    --shared-key         Use one API key for all stacks (default: per-stack random key)
+    --tunnel MODE        quick | named | none (default: quick)
+    --public-url URL     Public base URL (repeatable; align with --config or single for all)
+    --tunnel-name NAME   cloudflared tunnel name (for --tunnel named)
+    -v                   Verbose (INFO) and stream subprocess logs
+    -vv                  Debug (DEBUG) and stream subprocess logs
+    --stream             Stream subprocess logs without changing verbosity
+    --log-file PATH      Append logs to file (created if missing)
+    ```
 
-**`up`**
-Start mcpo (default `:8800`), start the front proxy (default `:8000`) that serves `/openapi.json` and proxies everything else, optionally run Cloudflare Tunnel, and generate the merged OpenAPI.
+- `status` — Show each stack’s ports, public URL, tools, and API key header.
 
-Options:
+- `openapi` — Regenerate merged OpenAPI for each running stack.
+  - Options:
+    ```
+    --public-url URL     Repeatable; one per running stack (or one applied to all)
+    ```
 
-```bash
---config PATH        Path to Claude-style config (default: mcp.config.json)
---port N             Front proxy port (default: 8000)
---mcpo-port N        mcpo port (default: 8800)
---api-key KEY        API key for mcpo (generated if omitted)
---tunnel MODE        quick | named | none (default: quick)
---public-url URL     Public base URL used inside the merged OpenAPI (recommended for named/none)
---tunnel-name NAME   Named tunnel to run (for --tunnel named)
--v                   Verbose logs
--vv                  Debug logs
---quiet              Suppress subprocess logs (mcpo/cloudflared) in console
-```
+- `share` — Print `/openapi.json` URL(s) per stack for easy copy/paste.
 
-**`status`**
-Show ports, public URL (if any), detected tool names, and your API key header.
+- `down` — Stop cloudflared and **mcpo + its child MCP servers** for **all** stacks.
 
-**`openapi`**
-Regenerate the merged OpenAPI (useful after editing your config).
-Options:
+- `doctor` — Check required binaries.
 
-```bash
---public-url URL     Override the base URL used in the spec’s servers[0].url
-```
+### Default output vs verbose
 
-**`share`**
-Print the single URL ending in `/openapi.json` for easy copy/paste.
-
-**`down`**
-Stop `cloudflared` and **mcpo + its child MCP servers**.
-
-**`doctor`**
-Check for required binaries (`mcpo`, `cloudflared`), plus `uvx` and `npx` if your config references them.
-
-**`version`**
-Print the CLI version.
+- **Default:** only essentials → per‑stack schema URL(s) and `X‑API‑Key` values. No log spam.
+- **`-v` / `-vv`:** stream `mcpo`/`cloudflared` logs and print extra details like chosen ports.
+- **`--log-file`:** always captures *everything* (our messages + subprocess output), regardless of verbosity.
 
 ---
 
 ## Configuration reference (`mcp.config.json`)
-
-This file is **Claude/Desktop‑style** and read by **mcpo** directly. `mcp-launch` just points `mcpo` at it.
 
 ```json
 {
@@ -280,60 +217,23 @@ This file is **Claude/Desktop‑style** and read by **mcpo** directly. `mcp-laun
 }
 ```
 
-- Each server is exposed by mcpo at `/<name>` with docs at `/<name>/docs`.
-- If you prefer **SSE/HTTP** for a server you run yourself, mcpo also supports config entries with `type: "sse"` or `"streamable-http"` and a `url`. You can place such entries here, and mcpo will connect.
-
 ---
 
 ## Security notes
 
-- **API key**: `mcp-launch` uses a cryptographically random key when you don’t pass `--api-key`. All requests must include `X-API-Key: <value>`. Rotate anytime by re‑running `up` with a new key and updating your GPT Action.
-- **Surface area**: The front proxy serves only `/openapi.json` and proxies the rest to mcpo. mcpo exposes only the tools you’ve configured.
+- **API keys**: by default, **per‑stack random keys**. Use `--shared-key` to reuse one across stacks. All requests must include `X-API-Key: <value>`.
 - **Tunnels**: Quick Tunnels are convenient but **ephemeral**; use Named Tunnels for stable URLs.
 
 ---
 
 ## Troubleshooting
 
-- **Binary not found**
-  `doctor` will tell you if `mcpo`, `cloudflared`, `uvx`, or `npx` can’t be found in `PATH`.
-
-- **No public URL printed** (Quick Tunnel)
-  Sometimes `cloudflared` logs are slow to emit the `.trycloudflare.com` URL. Re‑run `up --tunnel quick`. If it persists, prefer a Named Tunnel.
-
-- **Spec import fails in ChatGPT**
-  Ensure the schema URL ends with `/openapi.json` and that the spec’s `servers[0].url` is your **public** base. Re‑run:
-
+- **Spec import fails** — Ensure the schema URL ends with `/openapi.json` and the spec’s `servers[0].url` is public. Re‑run:
   ```bash
   mcp-launch openapi --public-url https://your-host
   ```
-
-- **Port in use**
-  The CLI auto‑picks the next available port near your chosen `--port`/`--mcpo-port`. Check `status` for the actual values.
-
----
-
-## FAQ
-
-**Q: Why not point ChatGPT to multiple Actions—one per server?**
-A: You can, but one merged Action keeps your GPT simpler and mirrors how IDEs bundle multiple MCP tools.
-
-**Q: Do I need special Cloudflare path rules?**
-A: No. The front proxy serves `/openapi.json` and proxies the rest on the same port/host. Just map your host to the front proxy.
-
-**Q: Where is state stored?**
-A: `./.mcp-launch/state.json` (ports, API key, public URL, PIDs).
-
----
-
-## Credits & thanks
-
-- **[`mcpo`](https://github.com/open-webui/mcpo)** by the Open WebUI community for the MCP→OpenAPI gateway, multi‑server config, hot‑reload, and per‑tool docs.
-- **[`Serena`](https://github.com/oraios/serena)** (and the broader MCP ecosystem) for robust servers and great examples.
-- **Cloudflare Tunnel** for simple, reliable public URLs to local services.
-- **Custom GPT Actions** for making OpenAPI‑described tools easy to wire into ChatGPT.
-
-If you encounter issues that are clearly upstream (e.g., a server’s schema or behavior), please consider filing them with the respective project to benefit everyone. This wrapper intentionally **avoids reinventing wheels**; when upstream adds new capabilities (e.g., unified specs), we’ll remove code rather than duplicate it.
+- **Noisy console** — Only with `-v`/`-vv`/`--stream`. Default output is minimal. Use `--log-file` to capture details without cluttering the terminal.
+- **Ctrl‑C didn’t stop everything** — Fixed: we kill each stack’s **mcpo** process group (so its spawned MCP servers too) and cloudflared.
 
 ---
 

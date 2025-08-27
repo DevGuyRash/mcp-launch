@@ -28,7 +28,7 @@ import (
 	"time"
 )
 
-const Version = "0.2.1"
+const Version = "0.4.0"
 
 const (
 	defaultFrontPort = 8000
@@ -38,6 +38,8 @@ const (
 	defaultConfig    = "mcp.config.json"
 )
 
+// ---------- config models ----------
+
 type MCPServer struct {
 	Command string            `json:"command,omitempty"`
 	Args    []string          `json:"args,omitempty"`
@@ -45,32 +47,53 @@ type MCPServer struct {
 	URL     string            `json:"url,omitempty"`  // for sse/streamable-http
 	Headers map[string]string `json:"headers,omitempty"`
 }
-
 type MCPConfig struct {
 	MCPServers map[string]MCPServer `json:"mcpServers"`
 }
 
-type State struct {
-	APIKey         string   `json:"api_key"`
+// ---------- runtime / state ----------
+
+type Instance struct {
+	Name           string   `json:"name"` // derived from config filename
 	ConfigPath     string   `json:"config_path"`
 	FrontPort      int      `json:"front_port"`
 	McpoPort       int      `json:"mcpo_port"`
+	APIKey         string   `json:"api_key"`
 	PublicURL      string   `json:"public_url"`
 	TunnelMode     string   `json:"tunnel_mode"` // quick|named|none
 	TunnelName     string   `json:"tunnel_name,omitempty"`
 	CloudflaredPID int      `json:"cloudflared_pid"`
 	McpoPID        int      `json:"mcpo_pid"`
 	ToolNames      []string `json:"tool_names"`
-	StartedAt      string   `json:"started_at"`
 }
+
+type State struct {
+	// Legacy single-instance fields (kept for backward compatibility)
+	APIKey         string   `json:"api_key,omitempty"`
+	ConfigPath     string   `json:"config_path,omitempty"`
+	FrontPort      int      `json:"front_port,omitempty"`
+	McpoPort       int      `json:"mcpo_port,omitempty"`
+	PublicURL      string   `json:"public_url,omitempty"`
+	TunnelMode     string   `json:"tunnel_mode,omitempty"`
+	TunnelName     string   `json:"tunnel_name,omitempty"`
+	CloudflaredPID int      `json:"cloudflared_pid,omitempty"`
+	McpoPID        int      `json:"mcpo_pid,omitempty"`
+	ToolNames      []string `json:"tool_names,omitempty"`
+
+	// Multi-instance (preferred)
+	Instances []Instance `json:"instances"`
+
+	StartedAt string `json:"started_at"`
+}
+
+// ---------- CLI ----------
 
 func main() {
 	if len(os.Args) < 2 {
 		usage()
 		return
 	}
-	cmd := os.Args[1]
-	switch cmd {
+	switch os.Args[1] {
 	case "help", "-h", "--help":
 		if len(os.Args) > 2 {
 			helpTopic(os.Args[2])
@@ -101,33 +124,25 @@ func main() {
 
 func usage() {
 	fmt.Println(`mcp-launch ` + Version + `
-One URL for many MCP servers (via mcpo). Serves /openapi.json and proxies everything else to mcpo.
+One URL per config for many MCP servers (via mcpo). Serves /openapi.json per stack and proxies everything else to its mcpo.
 
 USAGE
   mcp-launch <command> [options]
 
 COMMANDS
   init         Scaffold mcp.config.json and default state
-  up           Start mcpo + front proxy (+ optional Cloudflare Tunnel), then generate merged OpenAPI
-  status       Show ports, URLs, detected tools, API key
-  openapi      Regenerate merged OpenAPI (uses current/--public-url)
-  share        Print the single URL you paste into ChatGPT (Custom GPT → Actions → Import from URL)
-  down         Stop mcpo and cloudflared
+  up           Start one or more stacks (mcpo + proxy + optional Cloudflare) and generate merged OpenAPI per stack
+  status       Show ports, URLs, tools, API keys
+  openapi      Regenerate merged OpenAPI for running stacks (uses current/--public-url)
+  share        Print the URL(s) you paste into ChatGPT (Custom GPT → Actions → Import from URL)
+  down         Stop all stacks (mcpo trees and cloudflared)
   doctor       Check dependencies (mcpo, cloudflared, plus uvx/npx if referenced in config)
   help         Show help (try: mcp-launch help up)
   version      Print version
 
-QUICK START
-  mcp-launch init
-  mcp-launch up --tunnel quick
-  # Paste the printed https://.../openapi.json into Custom GPT → Actions → Import from URL
-
 NOTES
-  • Ctrl-C on 'up' will stop mcpo, its spawned MCP servers, the front proxy, and cloudflared.
-  • Front proxy listens on --port (default 8000) and serves /openapi.json on the same host&port it proxies.
-  • mcpo listens on --mcpo-port (default 8800).
-  • The API key is required on all requests (header X-API-Key). It is generated if not provided.
-  • State lives in ./.mcp-launch/state.json (ports, API key, public URL, etc).
+  • Ctrl-C on 'up' will stop all started stacks: mcpo (+ spawned MCP servers), front proxies, and cloudflared.
+  • Default output is minimal; use -v or -vv to stream detailed logs. Use --log-file to tee logs to a file.
 `)
 }
 
@@ -135,42 +150,61 @@ func helpTopic(name string) {
 	switch name {
 	case "up":
 		fmt.Println(`USAGE
-  mcp-launch up [--config PATH] [--port N] [--mcpo-port N] [--api-key KEY]
-                 [--tunnel quick|named|none] [--public-url URL] [--tunnel-name NAME]
-                 [-v | -vv] [--quiet]
+  mcp-launch up [--config PATH ...] [--port N] [--mcpo-port N] [--api-key KEY] [--shared-key]
+                 [--tunnel quick|named|none] [--public-url URL ...] [--tunnel-name NAME]
+                 [-v | -vv] [--stream] [--log-file PATH]
+
+DESCRIPTION
+  Starts one or more independent "stacks" (one per --config):
+    stack = mcpo(:<mcpo-port+i>) + front proxy(:<port+i>) + optional cloudflared tunnel
+  Each stack gets its own merged /openapi.json, URL, and API key (unless --shared-key is used).
 
 OPTIONS
-  --config PATH          Claude-style config (default: mcp.config.json)
-  --port N               Front proxy port serving API + /openapi.json (default: 8000)
-  --mcpo-port N          Internal mcpo port (default: 8800)
-  --api-key KEY          API key for mcpo (generated if omitted)
+  --config PATH          Repeatable. Claude-style config(s). Default: mcp.config.json if omitted.
+  --port N               Base front proxy port (default: 8000). Subsequent stacks use N+1, N+2, ...
+  --mcpo-port N          Base mcpo port (default: 8800). Subsequent stacks use N+1, N+2, ...
+  --api-key KEY          API key. With --shared-key this is used for all stacks; otherwise keys are generated per stack.
+  --shared-key           Use a single API key for all stacks (safer default is per-stack keys).
   --tunnel MODE          quick | named | none (default: quick)
-  --public-url URL       Public base URL used in the merged OpenAPI (recommended for named/none)
-  --tunnel-name NAME     Named tunnel to run (cloudflared tunnel run NAME)
-  -v                     Verbose logs from this CLI
-  -vv                    Debug logs from this CLI
-  --quiet                Suppress subprocess logs (mcpo/cloudflared) in console
+  --public-url URL       Repeatable. For named/none, provide one per --config (or one applied to all).
+  --tunnel-name NAME     Named tunnel to run (cloudflared tunnel run NAME) for each stack
+  -v                     Verbose INFO logs and stream subprocess output
+  -vv                    DEBUG logs (also streams subprocess output)
+  --stream               Stream subprocess logs without changing verbosity
+  --log-file PATH        Append logs to file (created if missing)
+
+WHY MULTI-CONFIG?
+  OpenAI Custom GPTs currently support ~30 tools per Action. Split your servers into multiple configs,
+  run multiple stacks, and import each /openapi.json in a different GPT/chat.
 
 EXAMPLES
-  # Dev (ephemeral URL):
-  mcp-launch up --tunnel quick
+  # Two stacks via Quick Tunnels (independent URLs + keys):
+  mcp-launch up \
+    --config code.json \
+    --config data.json \
+    --tunnel quick
 
-  # Stable domain (named tunnel already configured):
-  mcp-launch up --tunnel named --public-url https://gpt-tools.example.com --tunnel-name my-tunnel
+  # Two named stacks with stable hosts and a single shared API key:
+  mcp-launch up \
+    --config code.json --public-url https://gpt-code.example.com \
+    --config data.json --public-url https://gpt-data.example.com \
+    --tunnel named --tunnel-name my-tunnel \
+    --api-key SECRET --shared-key
 `)
 	case "openapi":
 		fmt.Println(`USAGE
-  mcp-launch openapi [--public-url URL]
-
+  mcp-launch openapi [--public-url URL ...]
 DESCRIPTION
-  Rebuild the merged OpenAPI document from the running mcpo per-tool specs,
-  set its servers[0].url to the provided --public-url (or the current state/public URL),
-  and store it for the front proxy to serve at /openapi.json.
+  Rebuild the merged OpenAPI document for each running stack from its per-tool specs,
+  and set servers[0].url to the provided --public-url(s) (one per stack or one for all)
+  or the instance's current public URL if not provided.
 `)
 	default:
 		usage()
 	}
 }
+
+// ---------- commands ----------
 
 func cmdInit() {
 	// Write default config if not exists
@@ -198,23 +232,25 @@ func cmdInit() {
 	}
 	ensureStateDir()
 	st := State{
-		APIKey:     randomKey(40),
-		ConfigPath: defaultConfig,
-		FrontPort:  defaultFrontPort,
-		McpoPort:   defaultMcpoPort,
-		TunnelMode: "quick",
-		StartedAt:  time.Now().Format(time.RFC3339),
+		StartedAt: time.Now().Format(time.RFC3339),
+		Instances: nil,
 	}
 	saveState(&st)
 	fmt.Println("Initialized .mcp-launch/state.json with defaults")
 }
 
 func cmdDoctor() {
+	// Read *a* config (if present) to suggest uvx/npx checks; otherwise just mcpo/cloudflared.
 	st := loadState()
-	// Check presence of mcpo and cloudflared
+	cfg := MCPConfig{}
+	if len(st.Instances) > 0 {
+		cfg = readConfig(st.Instances[0].ConfigPath)
+	} else if st.ConfigPath != "" {
+		cfg = readConfig(st.ConfigPath)
+	} else {
+		cfg = readConfig(defaultConfig)
+	}
 	checks := []string{"mcpo", "cloudflared"}
-	// If config references uvx/npx, check those too
-	cfg := readConfig(st.ConfigPath)
 	need := map[string]bool{}
 	for _, s := range cfg.MCPServers {
 		if s.Command != "" {
@@ -245,38 +281,40 @@ func cmdDoctor() {
 	}
 }
 
+type stringSlice []string
+
+func (s *stringSlice) String() string { return strings.Join(*s, ",") }
+func (s *stringSlice) Set(v string) error {
+	*s = append(*s, v)
+	return nil
+}
+
 func cmdUp() {
 	fs := flag.NewFlagSet("up", flag.ExitOnError)
 	fs.Usage = func() { helpTopic("up") }
-	config := fs.String("config", defaultConfig, "Path to mcpo config file")
-	port := fs.Int("port", defaultFrontPort, "Front HTTP port (serves /openapi.json and proxies to mcpo)")
-	mcpoPort := fs.Int("mcpo-port", defaultMcpoPort, "Internal mcpo port")
-	apiKey := fs.String("api-key", "", "API key for mcpo (optional; generated if empty)")
-	tunnel := fs.String("tunnel", "quick", "Tunnel mode: quick|named|none")
-	publicURL := fs.String("public-url", "", "Public base URL (required for named or none if you want merged spec to be correct)")
+	var configs stringSlice
+	var publicURLs stringSlice
+	fs.Var(&configs, "config", "Path to mcpo config file (repeatable)")
+	port := fs.Int("port", defaultFrontPort, "Base front HTTP port (serves /openapi.json and proxies to mcpo)")
+	mcpoPort := fs.Int("mcpo-port", defaultMcpoPort, "Base internal mcpo port")
+	apiKey := fs.String("api-key", "", "API key (used for all stacks if --shared-key)")
+	sharedKey := fs.Bool("shared-key", false, "Use a single API key for all stacks")
+	fs.Var(&publicURLs, "public-url", "Public base URL (repeatable; align with --config or single for all)")
 	tunnelName := fs.String("tunnel-name", "", "Named tunnel to run (optional; requires local cloudflared config)")
-	verbose := fs.Bool("v", false, "Verbose logs")
-	debug := fs.Bool("vv", false, "Debug logs")
-	quiet := fs.Bool("quiet", false, "Suppress mcpo/cloudflared logs")
+	tunnel := fs.String("tunnel", "quick", "Tunnel mode: quick|named|none")
+	verbose := fs.Bool("v", false, "Verbose logs (INFO)")
+	debug := fs.Bool("vv", false, "Debug logs (DEBUG)")
+	stream := fs.Bool("stream", false, "Stream subprocess logs without changing verbosity")
+	logPath := fs.String("log-file", "", "Append logs to file (created if missing)")
 	_ = fs.Parse(os.Args[2:])
 
 	ensureStateDir()
 	st := loadState()
-	if *apiKey == "" {
-		if st.APIKey == "" {
-			st.APIKey = randomKey(40)
-		}
-	} else {
-		st.APIKey = *apiKey
+
+	// Which configs?
+	if len(configs) == 0 {
+		configs = append(configs, defaultConfig)
 	}
-	st.ConfigPath = *config
-	st.FrontPort = pickPort(*port)
-	st.McpoPort = pickPort(*mcpoPort)
-	st.TunnelMode = *tunnel
-	if *publicURL != "" {
-		st.PublicURL = strings.TrimRight(*publicURL, "/")
-	}
-	saveState(&st)
 
 	verbosity := 0
 	if *debug {
@@ -284,119 +322,211 @@ func cmdUp() {
 	} else if *verbose {
 		verbosity = 1
 	}
+	streamProcs := *stream || *verbose || *debug
 
-	// Start mcpo
-	mcpoCmd := exec.Command(findBinary("mcpo"), "--port", fmt.Sprint(st.McpoPort), "--api-key", st.APIKey, "--config", st.ConfigPath, "--hot-reload")
-	// Put mcpo in its own process group so we can kill the whole tree (mcpo + spawned MCP servers)
-	if runtime.GOOS != "windows" {
-		mcpoCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// Open log file (optional)
+	lf, err := openLogFile(*logPath)
+	if err != nil {
+		fmt.Println("Could not open log file:", err)
 	}
-	mcpoStdout, _ := mcpoCmd.StdoutPipe()
-	mcpoStderr, _ := mcpoCmd.StderrPipe()
-	if err := mcpoCmd.Start(); err != nil {
-		fmt.Println("Failed to start mcpo:", err)
-		return
-	}
-	st.McpoPID = mcpoCmd.Process.Pid
-	saveState(&st)
-	if !*quiet {
-		go streamPrefixed("mcpo", mcpoStdout)
-		go streamPrefixed("mcpo", mcpoStderr)
-	}
-	waitURL(fmt.Sprintf("http://127.0.0.1:%d/docs", st.McpoPort), 60*time.Second)
-
-	// Determine tool names from config
-	cfg := readConfig(st.ConfigPath)
-	var toolNames []string
-	for name := range cfg.MCPServers {
-		toolNames = append(toolNames, name)
-	}
-	slices.Sort(toolNames)
-	st.ToolNames = toolNames
-	saveState(&st)
-
-	// Start front proxy (serves /openapi.json, proxies to mcpo)
-	proxy := newFrontProxy(st)
-	go func() {
-		if err := proxy.Serve(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			fmt.Println("Front proxy error:", err)
+	defer func() {
+		if lf != nil {
+			_ = lf.Close()
 		}
 	}()
 
-	// Start tunnel
-	var quickURL string
-	switch st.TunnelMode {
-	case "quick":
-		quickURL = startQuickTunnel(st.FrontPort, *quiet)
-		if quickURL == "" {
-			fmt.Println("Quick Tunnel failed; continuing without a public URL.")
+	// Determine API key(s)
+	shared := ""
+	if *sharedKey {
+		if *apiKey != "" {
+			shared = *apiKey
+		} else if st.APIKey != "" {
+			shared = st.APIKey
 		} else {
-			st.PublicURL = quickURL
-			saveState(&st)
+			shared = randomKey(40)
 		}
-	case "named":
-		if st.PublicURL == "" {
-			fmt.Println("Named tunnel selected but --public-url not provided. Please pass --public-url https://your.host")
-		}
-		startNamedTunnel(*tunnelName)
-	case "none":
-		// no-op
-	default:
-		fmt.Println("Unknown tunnel mode:", st.TunnelMode)
+		// Store on legacy field for convenience
+		st.APIKey = shared
 	}
 
-	// Generate merged OpenAPI with known PublicURL (or localhost if still empty)
-	baseURL := st.PublicURL
-	if baseURL == "" {
-		baseURL = fmt.Sprintf("http://127.0.0.1:%d", st.FrontPort)
-	}
-	spec, err := mergeOpenAPI(st, baseURL)
-	if err != nil {
-		fmt.Println("OpenAPI merge failed:", err)
-	} else {
-		proxy.SetOpenAPI(spec)
-		fmt.Println("Merged OpenAPI available at:", fmt.Sprintf("http://127.0.0.1:%d/openapi.json", st.FrontPort))
-		if st.PublicURL != "" {
-			fmt.Println("Public OpenAPI URL:", st.PublicURL+"/openapi.json")
+	// Build instance plans
+	instances := make([]Instance, 0, len(configs))
+	for i, cfgPath := range configs {
+		name := nameFromPath(cfgPath, i)
+		inst := Instance{
+			Name:       name,
+			ConfigPath: cfgPath,
+			FrontPort:  pickPort(*port + i),
+			McpoPort:   pickPort(*mcpoPort + i),
+			TunnelMode: *tunnel,
+			TunnelName: *tunnelName,
 		}
+		if *sharedKey {
+			inst.APIKey = shared
+		} else {
+			inst.APIKey = randomKey(40)
+		}
+		// Pre-set public URL if provided
+		if len(publicURLs) == 1 {
+			inst.PublicURL = strings.TrimRight(publicURLs[0], "/")
+		} else if len(publicURLs) > i {
+			inst.PublicURL = strings.TrimRight(publicURLs[i], "/")
+		}
+		instances = append(instances, inst)
 	}
 
+	// Start stacks one by one
+	type running struct {
+		inst   *Instance
+		proxy  *frontProxy
+		mcpo   *exec.Cmd
+		tunnel *exec.Cmd // not needed for kill (we store PID in state), but kept for parity
+	}
+	runs := make([]*running, 0, len(instances))
+
+	for i := range instances {
+		inst := &instances[i]
+
+		// Start mcpo
+		mcpoCmd := exec.Command(findBinary("mcpo"),
+			"--port", fmt.Sprint(inst.McpoPort),
+			"--api-key", inst.APIKey,
+			"--config", inst.ConfigPath,
+			"--hot-reload",
+		)
+		if runtime.GOOS != "windows" {
+			mcpoCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		}
+		stdout, _ := mcpoCmd.StdoutPipe()
+		stderr, _ := mcpoCmd.StderrPipe()
+		if err := mcpoCmd.Start(); err != nil {
+			fmt.Printf("Failed to start mcpo for %s: %v\n", inst.Name, err)
+			continue
+		}
+		inst.McpoPID = mcpoCmd.Process.Pid
+		saveStateMulti(&st, instances)
+
+		tag := "mcpo#" + inst.Name
+		go scanAndMaybeStream(tag, stdout, streamProcs, lf, nil)
+		go scanAndMaybeStream(tag, stderr, streamProcs, lf, nil)
+
+		waitURL(fmt.Sprintf("http://127.0.0.1:%d/docs", inst.McpoPort), 60*time.Second)
+
+		// Tools
+		cfg := readConfig(inst.ConfigPath)
+		var toolNames []string
+		for name := range cfg.MCPServers {
+			toolNames = append(toolNames, name)
+		}
+		slices.Sort(toolNames)
+		inst.ToolNames = toolNames
+		saveStateMulti(&st, instances)
+
+		// Front proxy
+		proxy := newFrontProxy(inst.FrontPort, inst.McpoPort)
+		go func(name string, fp *frontProxy) {
+			if err := fp.Serve(); err != nil && !errors.Is(err, http.ErrServerClosed) && streamProcs {
+				fmt.Printf("[front#%s] error: %v\n", name, err)
+			}
+		}(inst.Name, proxy)
+		if verbosity > 0 {
+			fmt.Printf("[front#%s] http://127.0.0.1:%d\n", inst.Name, inst.FrontPort)
+		}
+
+		// Cloudflare
+		switch inst.TunnelMode {
+		case "quick":
+			u := startQuickTunnel("cloudflared#"+inst.Name, inst.FrontPort, streamProcs, lf)
+			if u == "" {
+				if verbosity > 0 {
+					fmt.Printf("[tunnel#%s] Quick Tunnel failed; continuing without a public URL.\n", inst.Name)
+				}
+			} else {
+				inst.PublicURL = u
+				saveStateMulti(&st, instances)
+			}
+		case "named":
+			if inst.PublicURL == "" && verbosity > 0 {
+				fmt.Printf("[tunnel#%s] Named tunnel selected but --public-url not provided. Please pass --public-url https://your.host\n", inst.Name)
+			}
+			startNamedTunnel("cloudflared#"+inst.Name, inst.TunnelName, streamProcs, lf)
+		case "none":
+			// no-op
+		default:
+			if verbosity > 0 {
+				fmt.Printf("[tunnel#%s] Unknown tunnel mode: %s\n", inst.Name, inst.TunnelMode)
+			}
+		}
+
+		// Merge OpenAPI for this instance
+		baseURL := inst.PublicURL
+		if baseURL == "" {
+			baseURL = fmt.Sprintf("http://127.0.0.1:%d", inst.FrontPort)
+		}
+		spec, err := mergeOpenAPI(*inst, baseURL)
+		if err != nil {
+			fmt.Printf("[openapi#%s] merge failed: %v\n", inst.Name, err)
+		} else {
+			proxy.SetOpenAPI(spec)
+		}
+
+		runs = append(runs, &running{inst: inst, proxy: proxy, mcpo: mcpoCmd})
+	}
+
+	// Minimal “important” output
 	fmt.Println()
-	fmt.Println("=== SHARE THIS WITH CHATGPT (Actions → Import from URL) ===")
-	if st.PublicURL != "" {
-		fmt.Println(st.PublicURL + "/openapi.json")
-	} else {
-		fmt.Printf("http://127.0.0.1:%d/openapi.json (local only)\n", st.FrontPort)
+	if len(runs) == 0 {
+		fmt.Println("No stacks started.")
+		return
 	}
-	fmt.Println("API key header: X-API-Key:", st.APIKey, "(saved in .mcp-launch/state.json; also see `mcp-launch status`)")
+	fmt.Println("=== SHARE THESE WITH CHATGPT (Actions → Import from URL) ===")
+	for idx, r := range runs {
+		inst := r.inst
+		url := inst.PublicURL
+		if url == "" {
+			url = fmt.Sprintf("http://127.0.0.1:%d", inst.FrontPort)
+		}
+		fmt.Printf("%d) %s/openapi.json  (config: %s)\n", idx+1, url, filepath.Base(inst.ConfigPath))
+		fmt.Printf("   X-API-Key: %s\n", inst.APIKey)
+	}
 	fmt.Println()
 
-	// Handle signals and mcpo exit
+	// Handle signals and mcpo exits
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	mcpoDone := make(chan error, 1)
-	go func() { mcpoDone <- mcpoCmd.Wait() }()
+
+	doneCh := make(chan string, len(runs))
+	for _, r := range runs {
+		go func(name string, cmd *exec.Cmd) {
+			_ = cmd.Wait()
+			doneCh <- name
+		}(r.inst.Name, r.mcpo)
+	}
 
 	if verbosity > 0 {
 		fmt.Println("Press Ctrl+C to stop (or run `mcp-launch down` from another shell).")
 	}
 
 	cleanup := func() {
-		// stop proxy
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		_ = proxy.Close(ctx)
-		cancel()
-		// stop cloudflared
-		if st.CloudflaredPID > 0 {
-			_ = killPID(st.CloudflaredPID)
-			st.CloudflaredPID = 0
+		// stop proxies first
+		for _, r := range runs {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			_ = r.proxy.Close(ctx)
+			cancel()
 		}
-		// stop mcpo tree (and all spawned MCP servers)
-		if st.McpoPID > 0 {
-			_ = killProcessTree(st.McpoPID)
-			st.McpoPID = 0
+		// stop cloudflared and mcpo trees
+		for i := range instances {
+			inst := &instances[i]
+			if inst.CloudflaredPID > 0 {
+				_ = killPID(inst.CloudflaredPID)
+				inst.CloudflaredPID = 0
+			}
+			if inst.McpoPID > 0 {
+				_ = killProcessGroup(inst.McpoPID)
+				inst.McpoPID = 0
+			}
 		}
-		saveState(&st)
+		saveStateMulti(&st, instances)
 	}
 
 	select {
@@ -405,9 +535,9 @@ func cmdUp() {
 			fmt.Println("\nReceived signal, shutting down…")
 		}
 		cleanup()
-	case err := <-mcpoDone:
-		if err != nil && verbosity > 0 {
-			fmt.Println("\nmcpo exited:", err)
+	case name := <-doneCh:
+		if verbosity > 0 {
+			fmt.Println("\nmcpo exited for stack:", name)
 		}
 		cleanup()
 	}
@@ -415,39 +545,90 @@ func cmdUp() {
 
 func cmdStatus() {
 	st := loadState()
-	fmt.Println("mcp-launch status:")
-	fmt.Printf("- Front: http://127.0.0.1:%d  (serves /openapi.json; proxies to mcpo)\n", st.FrontPort)
-	fmt.Printf("- mcpo:  http://127.0.0.1:%d\n", st.McpoPort)
-	if st.PublicURL != "" {
-		fmt.Println("- Public URL:", st.PublicURL)
-	} else {
-		fmt.Println("- Public URL: (none)")
+	if len(st.Instances) == 0 {
+		// Legacy single-instance print (if present)
+		fmt.Println("mcp-launch status (legacy):")
+		fmt.Printf("- Front: http://127.0.0.1:%d\n", st.FrontPort)
+		fmt.Printf("- mcpo:  http://127.0.0.1:%d\n", st.McpoPort)
+		if st.PublicURL != "" {
+			fmt.Println("- Public URL:", st.PublicURL)
+		} else {
+			fmt.Println("- Public URL: (none)")
+		}
+		fmt.Println("- Tunnel:", st.TunnelMode)
+		if len(st.ToolNames) > 0 {
+			fmt.Println("- Tools:", strings.Join(st.ToolNames, ", "))
+		}
+		if st.APIKey != "" {
+			fmt.Println("- API key (X-API-Key):", st.APIKey)
+		}
+		return
 	}
-	fmt.Println("- Tunnel:", st.TunnelMode)
-	fmt.Println("- Tools:", strings.Join(st.ToolNames, ", "))
-	fmt.Println("- API key (X-API-Key):", st.APIKey)
+
+	fmt.Println("mcp-launch status (multi):")
+	for i, inst := range st.Instances {
+		base := inst.PublicURL
+		if base == "" {
+			base = fmt.Sprintf("http://127.0.0.1:%d", inst.FrontPort)
+		}
+		fmt.Printf("[%d] %s\n", i+1, inst.Name)
+		fmt.Printf("    Front: %s/openapi.json\n", base)
+		fmt.Printf("    mcpo:  http://127.0.0.1:%d\n", inst.McpoPort)
+		fmt.Printf("    Tunnel: %s\n", inst.TunnelMode)
+		if len(inst.ToolNames) > 0 {
+			fmt.Printf("    Tools: %s\n", strings.Join(inst.ToolNames, ", "))
+		}
+		fmt.Printf("    X-API-Key: %s\n", inst.APIKey)
+	}
 }
 
 func cmdShare() {
 	st := loadState()
-	if st.PublicURL == "" {
-		fmt.Printf("No public URL known yet. Local: http://127.0.0.1:%d/openapi.json\n", st.FrontPort)
+	if len(st.Instances) == 0 {
+		if st.PublicURL == "" {
+			fmt.Printf("Local: http://127.0.0.1:%d/openapi.json\n", st.FrontPort)
+			return
+		}
+		fmt.Println(st.PublicURL + "/openapi.json")
 		return
 	}
-	fmt.Println(st.PublicURL + "/openapi.json")
+	for _, inst := range st.Instances {
+		base := inst.PublicURL
+		if base == "" {
+			base = fmt.Sprintf("http://127.0.0.1:%d", inst.FrontPort)
+		}
+		fmt.Printf("%s: %s/openapi.json\n", inst.Name, base)
+	}
 }
 
 func cmdDown() {
 	st := loadState()
-	// Kill cloudflared
+	// Prefer multi-instance
+	if len(st.Instances) > 0 {
+		for i := range st.Instances {
+			inst := &st.Instances[i]
+			if inst.CloudflaredPID > 0 {
+				_ = killPID(inst.CloudflaredPID)
+				fmt.Println("Stopped cloudflared (pid", inst.CloudflaredPID, ") for", inst.Name)
+				inst.CloudflaredPID = 0
+			}
+			if inst.McpoPID > 0 {
+				_ = killProcessGroup(inst.McpoPID)
+				fmt.Println("Stopped mcpo (pid", inst.McpoPID, ") and its child MCP servers for", inst.Name)
+				inst.McpoPID = 0
+			}
+		}
+		saveState(&st)
+		return
+	}
+	// Fallback legacy
 	if st.CloudflaredPID > 0 {
 		_ = killPID(st.CloudflaredPID)
 		fmt.Println("Stopped cloudflared (pid", st.CloudflaredPID, ")")
 		st.CloudflaredPID = 0
 	}
-	// Kill mcpo (+ children)
 	if st.McpoPID > 0 {
-		_ = killProcessTree(st.McpoPID)
+		_ = killProcessGroup(st.McpoPID)
 		fmt.Println("Stopped mcpo (pid", st.McpoPID, ") and its child MCP servers")
 		st.McpoPID = 0
 	}
@@ -457,27 +638,39 @@ func cmdDown() {
 func cmdOpenAPI() {
 	fs := flag.NewFlagSet("openapi", flag.ExitOnError)
 	fs.Usage = func() { helpTopic("openapi") }
-	publicURL := fs.String("public-url", "", "Public base URL (optional override)")
+	var publicURLs stringSlice
+	fs.Var(&publicURLs, "public-url", "Public base URL (repeatable; align with running stacks or one for all)")
 	_ = fs.Parse(os.Args[2:])
+
 	st := loadState()
-	baseURL := st.PublicURL
-	if *publicURL != "" {
-		baseURL = strings.TrimRight(*publicURL, "/")
-	}
-	if baseURL == "" {
-		baseURL = fmt.Sprintf("http://127.0.0.1:%d", st.FrontPort)
-	}
-	spec, err := mergeOpenAPI(st, baseURL)
-	if err != nil {
-		fmt.Println("OpenAPI merge failed:", err)
+	if len(st.Instances) == 0 {
+		fmt.Println("No running stacks found in state.")
 		return
 	}
-	// write to front proxy file path if running, otherwise dump to stdout
-	out := filepath.Join(getStateDir(), "openapi.json")
-	_ = os.WriteFile(out, spec, 0644)
-	fmt.Println("Wrote merged OpenAPI to", out)
-	fmt.Printf("Serve URL (if front proxy running): http://127.0.0.1:%d/openapi.json\n", st.FrontPort)
+	for i := range st.Instances {
+		inst := &st.Instances[i]
+		baseURL := inst.PublicURL
+		if len(publicURLs) == 1 {
+			baseURL = strings.TrimRight(publicURLs[0], "/")
+		} else if len(publicURLs) > i {
+			baseURL = strings.TrimRight(publicURLs[i], "/")
+		}
+		if baseURL == "" {
+			baseURL = fmt.Sprintf("http://127.0.0.1:%d", inst.FrontPort)
+		}
+		spec, err := mergeOpenAPI(*inst, baseURL)
+		if err != nil {
+			fmt.Printf("[openapi#%s] merge failed: %v\n", inst.Name, err)
+			continue
+		}
+		out := filepath.Join(getStateDir(), fmt.Sprintf("openapi_%s.json", inst.Name))
+		_ = os.WriteFile(out, spec, 0644)
+		fmt.Printf("Wrote merged OpenAPI for %s to %s\n", inst.Name, out)
+		fmt.Printf("Serve URL (if front proxy running): http://127.0.0.1:%d/openapi.json\n", inst.FrontPort)
+	}
 }
+
+// ---------- helpers ----------
 
 func readConfig(path string) MCPConfig {
 	data, err := os.ReadFile(path)
@@ -494,19 +687,17 @@ func ensureStateDir() string {
 	_ = os.MkdirAll(dir, 0o755)
 	return dir
 }
-
-func getStateDir() string {
-	return filepath.Join(".", stateDirName)
-}
-
-func statePath() string {
-	return filepath.Join(getStateDir(), stateFileName)
-}
+func getStateDir() string { return filepath.Join(".", stateDirName) }
+func statePath() string   { return filepath.Join(getStateDir(), stateFileName) }
 
 func saveState(st *State) {
 	_ = os.MkdirAll(getStateDir(), 0o755)
 	data, _ := json.MarshalIndent(st, "", "  ")
 	_ = os.WriteFile(statePath(), data, 0644)
+}
+func saveStateMulti(st *State, instances []Instance) {
+	st.Instances = instances
+	saveState(st)
 }
 
 func loadState() State {
@@ -514,14 +705,10 @@ func loadState() State {
 	var st State
 	data, err := os.ReadFile(path)
 	if err != nil {
-		// defaults
+		// default empty state
 		st = State{
-			APIKey:     randomKey(40),
-			ConfigPath: defaultConfig,
-			FrontPort:  defaultFrontPort,
-			McpoPort:   defaultMcpoPort,
-			TunnelMode: "quick",
-			StartedAt:  time.Now().Format(time.RFC3339),
+			StartedAt: time.Now().Format(time.RFC3339),
+			Instances: nil,
 		}
 		saveState(&st)
 		return st
@@ -543,10 +730,38 @@ func findBinary(name string) string {
 	return name // let exec fail and print a clearer error
 }
 
-func streamPrefixed(tag string, r io.Reader) {
+var logFileMu sync.Mutex
+
+func openLogFile(path string) (*os.File, error) {
+	if path == "" {
+		return nil, nil
+	}
+	if dir := filepath.Dir(path); dir != "." && dir != "" {
+		_ = os.MkdirAll(dir, 0o755)
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return nil, err
+	}
+	_, _ = fmt.Fprintf(f, "=== mcp-launch %s started at %s ===\n", Version, time.Now().Format(time.RFC3339))
+	return f, nil
+}
+
+func scanAndMaybeStream(tag string, r io.Reader, stream bool, logFile *os.File, onLine func(string)) {
 	sc := bufio.NewScanner(r)
 	for sc.Scan() {
-		fmt.Printf("[%s] %s\n", tag, sc.Text())
+		line := sc.Text()
+		if stream {
+			fmt.Printf("[%s] %s\n", tag, line)
+		}
+		if logFile != nil {
+			logFileMu.Lock()
+			_, _ = fmt.Fprintf(logFile, "[%s] %s\n", tag, line)
+			logFileMu.Unlock()
+		}
+		if onLine != nil {
+			onLine(line)
+		}
 	}
 }
 
@@ -554,7 +769,6 @@ func randomKey(n int) string {
 	const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	buf := make([]byte, n)
 	if _, err := rand.Read(buf); err != nil {
-		// fallback to time-based seed if crypto fails (unlikely)
 		for i := range buf {
 			buf[i] = alphabet[int(time.Now().UnixNano()+int64(i))%len(alphabet)]
 		}
@@ -577,7 +791,6 @@ func pickPort(preferred int) int {
 	}
 	return preferred
 }
-
 func isFree(port int) bool {
 	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
@@ -588,17 +801,16 @@ func isFree(port int) bool {
 }
 
 type frontProxy struct {
-	st    State
 	srv   *http.Server
 	proxy *httputil.ReverseProxy
 	mu    sync.RWMutex
 	spec  []byte // merged openapi
 }
 
-func newFrontProxy(st State) *frontProxy {
-	target, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", st.McpoPort))
+func newFrontProxy(frontPort, mcpoPort int) *frontProxy {
+	target, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", mcpoPort))
 	p := httputil.NewSingleHostReverseProxy(target)
-	fp := &frontProxy{st: st, proxy: p}
+	fp := &frontProxy{proxy: p}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/openapi.json", func(w http.ResponseWriter, r *http.Request) {
 		fp.mu.RLock()
@@ -610,41 +822,30 @@ func newFrontProxy(st State) *frontProxy {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(fp.spec)
 	})
-	// simple health
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
-	// proxy everything else
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		p.ServeHTTP(w, r)
 	})
 	fp.srv = &http.Server{
-		Addr:    fmt.Sprintf(":%d", st.FrontPort),
+		Addr:    fmt.Sprintf(":%d", frontPort),
 		Handler: mux,
 	}
 	return fp
 }
-
-func (f *frontProxy) Serve() error {
-	fmt.Printf("Front proxy listening on http://127.0.0.1:%d\n", f.st.FrontPort)
-	return f.srv.ListenAndServe()
-}
-
+func (f *frontProxy) Serve() error { return f.srv.ListenAndServe() }
 func (f *frontProxy) SetOpenAPI(spec []byte) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.spec = spec
 }
+func (f *frontProxy) Close(ctx context.Context) error { return f.srv.Shutdown(ctx) }
 
-func (f *frontProxy) Close(ctx context.Context) error {
-	return f.srv.Shutdown(ctx)
-}
-
-func startQuickTunnel(frontPort int, quiet bool) string {
+func startQuickTunnel(tag string, frontPort int, stream bool, logFile *os.File) string {
 	bin := findBinary("cloudflared")
 	cmd := exec.Command(bin, "tunnel", "--url", fmt.Sprintf("http://127.0.0.1:%d", frontPort))
-	// Keep default process-group behavior; we kill by PID directly for cloudflared
 	stdout, _ := cmd.StdoutPipe()
 	stderr, _ := cmd.StderrPipe()
 	if err := cmd.Start(); err != nil {
@@ -653,49 +854,57 @@ func startQuickTunnel(frontPort int, quiet bool) string {
 	}
 	// save PID
 	st := loadState()
-	st.CloudflaredPID = cmd.Process.Pid
+	// best-effort: find matching instance by frontPort and set PID
+	for i := range st.Instances {
+		if st.Instances[i].FrontPort == frontPort {
+			st.Instances[i].CloudflaredPID = cmd.Process.Pid
+			break
+		}
+	}
 	saveState(&st)
+
 	// Parse URL from output
 	urlCh := make(chan string, 1)
-	parse := func(r io.Reader) {
-		sc := bufio.NewScanner(r)
-		for sc.Scan() {
-			line := sc.Text()
-			if !quiet {
-				fmt.Println("[cloudflared]", line)
-			}
-			if strings.Contains(line, "trycloudflare.com") {
-				u := findFirstURL(line)
-				if u != "" {
-					urlCh <- u
-				}
+	parse := func(line string) {
+		if strings.Contains(line, "trycloudflare.com") {
+			u := findFirstURL(line)
+			if u != "" {
+				urlCh <- u
 			}
 		}
 	}
-	go parse(stdout)
-	go parse(stderr)
+	go scanAndMaybeStream(tag, stdout, stream, logFile, parse)
+	go scanAndMaybeStream(tag, stderr, stream, logFile, parse)
+
 	select {
 	case u := <-urlCh:
 		return strings.TrimSuffix(u, "/")
-	case <-time.After(20 * time.Second):
+	case <-time.After(25 * time.Second):
 		return ""
 	}
 }
 
-func startNamedTunnel(name string) {
-	if name == "" {
-		// run default named tunnel from config
-		cmd := exec.Command(findBinary("cloudflared"), "tunnel", "run")
-		_ = cmd.Start()
-		st := loadState()
-		st.CloudflaredPID = cmd.Process.Pid
-		saveState(&st)
-		return
+func startNamedTunnel(tag, name string, stream bool, logFile *os.File) {
+	args := []string{"tunnel", "run"}
+	if name != "" {
+		args = append(args, name)
 	}
-	cmd := exec.Command(findBinary("cloudflared"), "tunnel", "run", name)
+	cmd := exec.Command(findBinary("cloudflared"), args...)
+	stdout, _ := cmd.StdoutPipe()
+	stderr, _ := cmd.StderrPipe()
 	_ = cmd.Start()
+	go scanAndMaybeStream(tag, stdout, stream, logFile, nil)
+	go scanAndMaybeStream(tag, stderr, stream, logFile, nil)
+
+	// save PID
 	st := loadState()
-	st.CloudflaredPID = cmd.Process.Pid
+	// no solid way to map to instance here; keep as best-effort: assign to first with empty PID
+	for i := range st.Instances {
+		if st.Instances[i].CloudflaredPID == 0 {
+			st.Instances[i].CloudflaredPID = cmd.Process.Pid
+			break
+		}
+	}
 	saveState(&st)
 }
 
@@ -704,7 +913,6 @@ func killPID(pid int) error {
 		return nil
 	}
 	if runtime.GOOS == "windows" {
-		// Kill the process tree (/T) forcefully (/F)
 		return exec.Command("taskkill", "/PID", fmt.Sprint(pid), "/T", "/F").Run()
 	}
 	pr, err := os.FindProcess(pid)
@@ -715,8 +923,8 @@ func killPID(pid int) error {
 	return nil
 }
 
-// killProcessTree kills a process and (on Unix) its entire process group.
-func killProcessTree(pid int) error {
+// killProcessGroup kills a process and (on Unix) its entire process group.
+func killProcessGroup(pid int) error {
 	if pid <= 0 {
 		return nil
 	}
@@ -751,31 +959,45 @@ func waitURL(u string, timeout time.Duration) {
 }
 
 func findFirstURL(s string) string {
-	// very small heuristic
 	i := strings.Index(s, "http")
 	if i == -1 {
 		return ""
 	}
 	seg := s[i:]
-	// cut at space
 	if j := strings.IndexByte(seg, ' '); j != -1 {
 		seg = seg[:j]
 	}
-	// cut trailing punctuation
 	seg = strings.Trim(seg, "[]()<>\"'")
 	return seg
 }
 
+func nameFromPath(p string, i int) string {
+	base := filepath.Base(p)
+	base = strings.TrimSuffix(base, filepath.Ext(base))
+	if base == "" {
+		return fmt.Sprintf("group%d", i+1)
+	}
+	// keep simple characters
+	base = strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			return r
+		}
+		return '-'
+	}, base)
+	return base
+}
+
 // -------- OpenAPI merge --------
-func mergeOpenAPI(st State, baseURL string) ([]byte, error) {
-	cfg := readConfig(st.ConfigPath)
+
+func mergeOpenAPI(inst Instance, baseURL string) ([]byte, error) {
+	cfg := readConfig(inst.ConfigPath)
 	if len(cfg.MCPServers) == 0 {
-		return nil, fmt.Errorf("no mcpServers in %s", st.ConfigPath)
+		return nil, fmt.Errorf("no mcpServers in %s", inst.ConfigPath)
 	}
 	merged := map[string]any{
 		"openapi": "3.1.0",
 		"info": map[string]any{
-			"title":   "MCP Tools via mcpo",
+			"title":   "MCP Tools via mcpo (" + inst.Name + ")",
 			"version": "1.0.0",
 		},
 		"servers": []any{
@@ -801,6 +1023,7 @@ func mergeOpenAPI(st State, baseURL string) ([]byte, error) {
 	}
 	pathsOut := merged["paths"].(map[string]any)
 	comp := merged["components"].(map[string]any)
+
 	// iterate tool names deterministically
 	names := make([]string, 0, len(cfg.MCPServers))
 	for name := range cfg.MCPServers {
@@ -809,11 +1032,10 @@ func mergeOpenAPI(st State, baseURL string) ([]byte, error) {
 	slices.Sort(names)
 	client := &http.Client{Timeout: 30 * time.Second}
 	for _, name := range names {
-		toolURL := fmt.Sprintf("http://127.0.0.1:%d/%s/openapi.json", st.McpoPort, name)
+		toolURL := fmt.Sprintf("http://127.0.0.1:%d/%s/openapi.json", inst.McpoPort, name)
 		req, _ := http.NewRequest("GET", toolURL, nil)
-		// authorize if mcpo is gated
-		if st.APIKey != "" {
-			req.Header.Set("X-API-Key", st.APIKey)
+		if inst.APIKey != "" {
+			req.Header.Set("X-API-Key", inst.APIKey)
 		}
 		resp, err := client.Do(req)
 		if err != nil {
@@ -831,7 +1053,6 @@ func mergeOpenAPI(st State, baseURL string) ([]byte, error) {
 		// Prefix $refs for components we are going to rename
 		localComp, _ := spec["components"].(map[string]any)
 		sections := []string{"schemas", "parameters", "responses", "requestBodies"}
-		// Track keys present so we only rewrite refs that exist
 		localKeys := map[string]map[string]bool{}
 		for _, sec := range sections {
 			localKeys[sec] = map[string]bool{}
@@ -841,9 +1062,9 @@ func mergeOpenAPI(st State, baseURL string) ([]byte, error) {
 				}
 			}
 		}
-		// Deep copy before rewrite
 		spec = deepCopy(spec).(map[string]any)
 		rewriteRefs(spec, name, localKeys)
+
 		// Move and rename components
 		if localComp != nil {
 			for _, sec := range sections {
@@ -871,7 +1092,6 @@ func mergeOpenAPI(st State, baseURL string) ([]byte, error) {
 						if oid, ok := om["operationId"].(string); ok && oid != "" {
 							om["operationId"] = name + "__" + oid
 						} else {
-							// synthesize one
 							om["operationId"] = name + "__" + strings.ToLower(method) + "_" + sanitizeForID(rawPath)
 						}
 					}
@@ -893,9 +1113,7 @@ func ensureLeadingSlash(s string) string {
 	}
 	return s
 }
-
 func sanitizeForID(p string) string {
-	// replace non-alphanumerics with underscores
 	var b strings.Builder
 	for _, r := range p {
 		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
@@ -906,39 +1124,9 @@ func sanitizeForID(p string) string {
 	}
 	return b.String()
 }
-
 func deepCopy(v any) any {
 	b, _ := json.Marshal(v)
 	var out any
 	_ = json.Unmarshal(b, &out)
 	return out
-}
-
-func rewriteRefs(v any, tool string, localKeys map[string]map[string]bool) {
-	switch t := v.(type) {
-	case map[string]any:
-		for k, val := range t {
-			if k == "$ref" {
-				if s, ok := val.(string); ok {
-					prefixes := []string{"#/components/schemas/", "#/components/parameters/", "#/components/responses/", "#/components/requestBodies/"}
-					for _, pref := range prefixes {
-						if strings.HasPrefix(s, pref) {
-							name := strings.TrimPrefix(s, pref)
-							sec := strings.Split(strings.TrimPrefix(pref, "#/components/"), "/")[0]
-							if localKeys[sec][name] {
-								t[k] = pref + tool + "__" + name
-							}
-							break
-						}
-					}
-				}
-			} else {
-				rewriteRefs(val, tool, localKeys)
-			}
-		}
-	case []any:
-		for i := range t {
-			rewriteRefs(t[i], tool, localKeys)
-		}
-	}
 }
