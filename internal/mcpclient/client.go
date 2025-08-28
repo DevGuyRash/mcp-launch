@@ -141,41 +141,59 @@ func inspectStdio(ctx context.Context, name string, s cfg.MCPServer) (Summary, e
         "jsonrpc": "2.0",
         "method":  "initialized",
     })
-    // 3) tools/list
-    _ = send(map[string]any{
-        "jsonrpc": "2.0",
-        "id":      2,
-        "method":  "tools/list",
-        "params":  map[string]any{},
-    })
-
-    // read id=2
+    // 3) tools/list with explicit null cursor and pagination
     var tools []Tool
-    ctxL, cancelL := context.WithTimeout(ctx, 6*time.Second)
-    defer cancelL()
+    nextID := 2
+    var cursorStr string // empty means first page (omit params entirely)
     for {
-        line, err := readLine(ctxL, rd)
-        if err != nil {
-            break
+        // Build params: only include cursor when non-empty
+        req := map[string]any{
+            "jsonrpc": "2.0",
+            "id":      nextID,
+            "method":  "tools/list",
         }
+        if strings.TrimSpace(cursorStr) != "" {
+            req["params"] = map[string]any{"cursor": cursorStr}
+        }
+        _ = send(req)
+
+        // read matching response
+        ctxL, cancelL := context.WithTimeout(ctx, 6*time.Second)
         var r resp
-        if json.Unmarshal([]byte(line), &r) == nil && r.ID != nil {
-            if i, ok := r.ID.(float64); ok && int(i) == 2 {
-                if r.Error != nil {
-                    _ = cmd.Process.Kill()
-                    return Summary{ServerName: name}, fmt.Errorf("tools/list failed: %s", r.Error.Message)
+        for {
+            line, err := readLine(ctxL, rd)
+            if err != nil {
+                cancelL()
+                _ = cmd.Process.Kill()
+                return Summary{ServerName: name}, fmt.Errorf("tools/list read: %w", err)
+            }
+            if json.Unmarshal([]byte(line), &r) == nil && r.ID != nil {
+                switch idv := r.ID.(type) {
+                case float64:
+                    if int(idv) == nextID { goto GOT }
+                case int:
+                    if idv == nextID { goto GOT }
                 }
-                // result: { tools: [ {name, description, ...} ], nextCursor?: string }
-                var wrapper struct {
-                    Tools      []Tool `json:"tools"`
-                    NextCursor string  `json:"nextCursor"`
-                }
-                if err := json.Unmarshal(r.Result, &wrapper); err == nil {
-                    tools = append(tools, wrapper.Tools...)
-                }
-                break
             }
         }
+GOT:
+        cancelL()
+        if r.Error != nil {
+            _ = cmd.Process.Kill()
+            return Summary{ServerName: name}, fmt.Errorf("tools/list failed: %s", r.Error.Message)
+        }
+        var wrapper struct {
+            Tools      []Tool `json:"tools"`
+            NextCursor string  `json:"nextCursor"`
+        }
+        if err := json.Unmarshal(r.Result, &wrapper); err == nil {
+            if len(wrapper.Tools) > 0 {
+                tools = append(tools, wrapper.Tools...)
+            }
+        }
+        if strings.TrimSpace(wrapper.NextCursor) == "" { break }
+        cursorStr = wrapper.NextCursor
+        nextID++
     }
     // be nice and terminate
     _ = cmd.Process.Kill()

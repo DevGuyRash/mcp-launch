@@ -435,4 +435,71 @@ docker compose -f security/authentik/docker-compose.yaml --profile outpost up -d
 - **Outpost workflow:** Create the **Outpost in Authentik UI first** (Provider → Application → Outpost), copy token → save to `security/authentik/secrets/outpost_token.secret` → start `authentik-outpost` with the compose profile → flip one Traefik router to `*-auth` (Authentik) and test.
 - **Accounts:** Create a **named superuser** for daily admin; enable **TOTP** (and WebAuthn). Convert `akadmin` to **break‑glass** (random long password in vault) or disable `is_active` (document re‑enable steps).
 - **Bootstrap vs DB:** `AUTHENTIK_BOOTSTRAP_*` apply **only on first DB init**. For existing installs, use `/lifecycle/ak` to reset passwords or create users; bootstrap won’t overwrite.
-- **LAN DNS sanity:** Keep Pi‑hole Local DNS `*.lablabland.com → 192.168.1.3` so on‑LAN traffic hits Traefik (access logs/metrics consistent).
+        - **LAN DNS sanity:** Keep Pi‑hole Local DNS `*.lablabland.com → 192.168.1.3` so on‑LAN traffic hits Traefik (access logs/metrics consistent).
+
+---
+
+## mcp-launch — TUI Quick Start (Preflight, Launch, Results)
+
+This repository includes a minimal supervisor `mcp-launch` with a Bubble Tea TUI that helps you inspect and launch MCP stacks (via mcpo) and optionally publish them over Cloudflare.
+
+### Build
+
+```bash
+go mod tidy && go build -o mcp-launch
+```
+
+### Launch (TUI)
+
+```bash
+./mcp-launch up --tui [--config path ...] [-v|-vv]
+```
+
+- If `--config` is omitted: a Config Collector appears so you can add paths in‑TUI (supports `~` and `$ENV`, Tab for suggestions), set verbosity, tunnel type, and base ports.
+
+### Preflight Screens & Keys
+
+- List
+  - `↑/↓` select server; `Enter`/`d` details; `c` tunnel picker; `g` toggle Controller (MCPO/RAW); `?` help.
+  - Badges: `OK`, `ERR`, `HTTP`, `DISABLED`.
+
+- Server Menu (selectable list)
+  - Edit allowed tools, Edit disallowed tools, Edit tool descriptions, Toggle disable.
+
+- Descriptions
+  - `e` edit (uses `$VISUAL/$EDITOR` if set; falls back to textarea).
+  - `d` diff (unified/side‑by‑side, `u/s`), `w` wrap toggle, `d/Enter/b/Esc` back.
+  - `m` multi‑select: `Space` toggle, `t` Trim Selected (word‑boundary ≤300), `r` Truncate Selected (hard cut ≤300), `-` Clear Selected, `b` back.
+  - Badges:
+    - `RAW n>300` raw too long; can be reduced
+    - `OVR TRIM ≤300` override equals a word-boundary trim of raw
+    - `OVR TRUNC ≤300` override equals a hard truncate of raw
+    - `OVR ≤300` custom short override
+
+- Tunnel Picker (MCPO controller)
+  - `Local (no tunnel)` → only 127.0.0.1 URLs
+  - `Cloudflare Quick` → trycloudflare.com URL
+  - `Cloudflare Named` → uses your named tunnel (no quick tunnel)
+
+- Controller (MCPO vs RAW)
+  - Press `g` on the list to toggle. MCPO runs full supervisor + merged OpenAPI; RAW starts MCP servers directly.
+
+### Results Screen
+
+After launch, a dedicated Results TUI shows per-stack summary and a logs panel.
+
+- Summary per stack
+  - OpenAPI URL, masked API key, config path
+  - MCP server count, Endpoints (warn near/over 30), per-server tool counts and long‑desc flags
+  - Copy block includes raw `OPENAPI=…` and `API_KEY=…`
+
+- Logs Panel (bounded)
+  - `l` toggle; `j/k` scroll, `Shift+J/K` fast scroll; `w` wrap
+  - `/` search; `n/N` next/prev match
+  - `S` save to `.mcp-launch/logs/YYYYMMDD_HHMMSS.log`
+
+### Notes
+
+- Preflight inspection uses `tools/list` pagination and retries for strict servers to avoid “Invalid request parameters”.
+- Diff unified view uses char‑level highlights; side‑by‑side also highlights at char level in both columns.
+- Multi‑select trim/truncate never overwrites fresh manual edits; it operates on the override when present.

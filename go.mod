@@ -7,6 +7,7 @@ toolchain go1.24.6
 require (
 	github.com/charmbracelet/bubbletea v1.3.6
 	github.com/charmbracelet/lipgloss v1.1.0
+	github.com/sergi/go-diff v1.3.1
 )
 
 require (
