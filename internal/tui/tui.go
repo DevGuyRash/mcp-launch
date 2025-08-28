@@ -1,38 +1,55 @@
 package tui
 
 import (
-	"fmt"
-	"sort"
-	"strings"
-	"unicode"
+    "fmt"
+    "os"
+    "sort"
+    "strings"
+    "unicode"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	mcpclient "mcp-launch/internal/mcpclient"
+    mcpclient "mcp-launch/internal/mcpclient"
+)
+
+// ServerStatus indicates inspection outcome for a server.
+type ServerStatus int
+
+const (
+    StatusOK ServerStatus = iota
+    StatusERR
+    StatusHTTP // reserved for future streamable-http detection
 )
 
 // Overlay is the edit overlay returned by the TUI.
 // NOTE: Keys are *composite* server IDs, e.g. "<instance>/<server>".
 // main.go translates these into per-instance overlays.
 type Overlay struct {
-	Disabled     map[string]bool              // "<inst>/<srv>" -> disabled?
-	Allow        map[string]map[string]bool   // "<inst>/<srv>" -> tool -> true
-	Deny         map[string]map[string]bool   // "<inst>/<srv>" -> tool -> true
-	Descriptions map[string]map[string]string // "<inst>/<srv>" -> tool -> descOverride
+    Disabled     map[string]bool              // "<inst>/<srv>" -> disabled?
+    Allow        map[string]map[string]bool   // "<inst>/<srv>" -> tool -> true
+    Deny         map[string]map[string]bool   // "<inst>/<srv>" -> tool -> true
+    Descriptions map[string]map[string]string // "<inst>/<srv>" -> tool -> descOverride
+    LastLaunch   string                       `json:"last_launch,omitempty"`
 }
 
 // Run shows a lightweight TUI that lets the user edit server/tool filters,
 // choose launch mode, and persist overlay state.
 // - servers: composite key "<inst>/<srv>" -> tools
 // - seed:    (optional) prior overlay to pre-populate selections
+// - status:  per-server status for preflight badges
+// - errs:    per-server error text (if any)
 // Returns (overlay or nil if cancelled, launchMode "mcpo"|"raw").
-func Run(servers map[string][]mcpclient.Tool, seed *Overlay) (*Overlay, string, error) {
-	m := newModel(servers, seed)
-	p := tea.NewProgram(&m, tea.WithAltScreen())
-	if _, err := p.Run(); err != nil {
-		return nil, "", err
-	}
-	return m.overlay, m.launchMode(), nil
+func Run(servers map[string][]mcpclient.Tool, seed *Overlay, status map[string]ServerStatus, errs map[string]string) (*Overlay, string, error) {
+    m := newModel(servers, seed, status, errs)
+    p := tea.NewProgram(&m, tea.WithAltScreen())
+    if _, err := p.Run(); err != nil {
+        return nil, "", err
+    }
+    // persist last launch choice into overlay so callers can save it across runs
+    if m.overlay != nil {
+        m.overlay.LastLaunch = m.launchMode()
+    }
+    return m.overlay, m.launchMode(), nil
 }
 
 /* ===== Model ===== */
@@ -40,21 +57,24 @@ func Run(servers map[string][]mcpclient.Tool, seed *Overlay) (*Overlay, string, 
 type mode string
 
 const (
-	modeList   mode = "list"   // choose server
-	modeMenu   mode = "menu"   // edit menu for a server
-	modeAllow  mode = "allow"  // edit allowed tools
-	modeDeny   mode = "deny"   // edit disallowed tools
-	modeDesc   mode = "desc"   // manage description overrides
-	modeDiff   mode = "diff"   // show before/after for current tool
-	modeLaunch mode = "launch" // choose launch mode
+    modeList   mode = "list"   // choose server
+    modeMenu   mode = "menu"   // edit menu for a server
+    modeAllow  mode = "allow"  // edit allowed tools
+    modeDeny   mode = "deny"   // edit disallowed tools
+    modeDesc   mode = "desc"   // manage description overrides
+    modeDiff   mode = "diff"   // show before/after for current tool
+    modeLaunch mode = "launch" // choose launch mode
+    modeDescEdit mode = "desc_edit" // direct edit description override
 )
 
 type model struct {
-	// data
-	servers  map[string][]mcpclient.Tool     // "<inst>/<srv>" -> tools
-	names    []string                        // ordered keys
-	origDesc map[string]map[string]string    // "<inst>/<srv>" -> tool -> original description
-	overlay  *Overlay                        // values to return (nil if cancelled)
+    // data
+    servers  map[string][]mcpclient.Tool     // "<inst>/<srv>" -> tools
+    names    []string                        // ordered keys
+    origDesc map[string]map[string]string    // "<inst>/<srv>" -> tool -> original description
+    overlay  *Overlay                        // values to return (nil if cancelled)
+    status   map[string]ServerStatus         // per-server status
+    errors   map[string]string               // per-server error text
 
 	// ui state
 	cursorServer int
@@ -68,12 +88,16 @@ type model struct {
 	// ephemeral selection state for allow/deny
 	editSelect map[string]bool // tool -> selected?
 
-	// last-diff cache
-	diffBefore string
-	diffAfter  string
+    // last-diff cache
+    diffBefore string
+    diffAfter  string
+
+    // editor buffer for description edit
+    editBuffer string
+    showHelp   bool
 }
 
-func newModel(servers map[string][]mcpclient.Tool, seed *Overlay) model {
+func newModel(servers map[string][]mcpclient.Tool, seed *Overlay, status map[string]ServerStatus, errs map[string]string) model {
 	names := make([]string, 0, len(servers))
 	orig := make(map[string]map[string]string, len(servers))
 	for k, tools := range servers {
@@ -86,12 +110,12 @@ func newModel(servers map[string][]mcpclient.Tool, seed *Overlay) model {
 	}
 	sort.Strings(names)
 
-	ov := &Overlay{
-		Disabled:     map[string]bool{},
-		Allow:        map[string]map[string]bool{},
-		Deny:         map[string]map[string]bool{},
-		Descriptions: map[string]map[string]string{},
-	}
+    ov := &Overlay{
+        Disabled:     map[string]bool{},
+        Allow:        map[string]map[string]bool{},
+        Deny:         map[string]map[string]bool{},
+        Descriptions: map[string]map[string]string{},
+    }
 	if seed != nil {
 		// shallow copy is fine (maps rewritten in place by TUI)
 		ov.Disabled = map[string]bool{}
@@ -121,14 +145,20 @@ func newModel(servers map[string][]mcpclient.Tool, seed *Overlay) model {
 		}
 	}
 
-	return model{
-		servers:  servers,
-		names:    names,
-		origDesc: orig,
-		overlay:  ov,
-		mode:     modeList,
-		launch:   "mcpo",
-	}
+    mdl := model{
+        servers:  servers,
+        names:    names,
+        origDesc: orig,
+        overlay:  ov,
+        status:   status,
+        errors:   errs,
+        mode:     modeList,
+        launch:   "mcpo",
+    }
+    if seed != nil && strings.TrimSpace(seed.LastLaunch) != "" {
+        mdl.launch = seed.LastLaunch
+    }
+    return mdl
 }
 
 func (m model) Init() tea.Cmd { return nil }
@@ -136,15 +166,18 @@ func (m model) Init() tea.Cmd { return nil }
 /* ===== Update ===== */
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
+    switch msg := msg.(type) {
 	case tea.KeyMsg:
 		k := strings.ToLower(msg.String())
 		switch m.mode {
-		case modeList:
-			switch k {
-			case "q", "ctrl+c":
-				m.overlay = nil
-				return m, tea.Quit
+            case modeList:
+                switch k {
+                case "q", "ctrl+c":
+                    m.overlay = nil
+                    return m, tea.Quit
+                case "?":
+                    m.showHelp = !m.showHelp
+                    return m, nil
 			case "up", "k":
 				if m.cursorServer > 0 {
 					m.cursorServer--
@@ -153,25 +186,28 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.cursorServer < len(m.names)-1 {
 					m.cursorServer++
 				}
-			case "enter":
-				if len(m.names) == 0 {
-					return m, nil
-				}
-				m.curServer = m.names[m.cursorServer]
-				m.mode = modeMenu
-				return m, nil
-			case "c":
-				m.mode = modeLaunch
-				return m, nil
-			}
-		case modeMenu:
-			switch k {
-			case "q", "ctrl+c":
-				m.overlay = nil
-				return m, tea.Quit
-			case "b", "esc":
-				m.mode = modeList
-				return m, nil
+                case "enter", "d":
+                    if len(m.names) == 0 {
+                        return m, nil
+                    }
+                    m.curServer = m.names[m.cursorServer]
+                    m.mode = modeMenu
+                    return m, nil
+                case "c":
+                    m.mode = modeLaunch
+                    return m, nil
+                }
+            case modeMenu:
+                switch k {
+                case "q", "ctrl+c":
+                    m.overlay = nil
+                    return m, tea.Quit
+                case "b", "esc":
+                    m.mode = modeList
+                    return m, nil
+                case "?":
+                    m.showHelp = !m.showHelp
+                    return m, nil
 			case "1", "a": // allowed tools
 				m.prepareToolEditor(true)
 				m.mode = modeAllow
@@ -191,14 +227,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.mode = modeLaunch
 				return m, nil
 			}
-		case modeAllow:
-			switch k {
-			case "q", "ctrl+c":
-				m.overlay = nil
-				return m, tea.Quit
-			case "b", "esc":
-				m.mode = modeMenu
-				return m, nil
+            case modeAllow:
+                switch k {
+                case "q", "ctrl+c":
+                    m.overlay = nil
+                    return m, tea.Quit
+                case "b", "esc":
+                    m.mode = modeMenu
+                    return m, nil
+                case "?":
+                    m.showHelp = !m.showHelp
+                    return m, nil
 			case "up", "k":
 				if m.cursorTool > 0 {
 					m.cursorTool--
@@ -238,14 +277,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.mode = modeMenu
 				return m, nil
 			}
-		case modeDeny:
-			switch k {
-			case "q", "ctrl+c":
-				m.overlay = nil
-				return m, tea.Quit
-			case "b", "esc":
-				m.mode = modeMenu
-				return m, nil
+            case modeDeny:
+                switch k {
+                case "q", "ctrl+c":
+                    m.overlay = nil
+                    return m, tea.Quit
+                case "b", "esc":
+                    m.mode = modeMenu
+                    return m, nil
+                case "?":
+                    m.showHelp = !m.showHelp
+                    return m, nil
 			case "up", "k":
 				if m.cursorTool > 0 {
 					m.cursorTool--
@@ -277,23 +319,42 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.mode = modeMenu
 				return m, nil
 			}
-		case modeDesc:
-			switch k {
-			case "q", "ctrl+c":
-				m.overlay = nil
-				return m, tea.Quit
-			case "b", "esc", "enter":
-				m.mode = modeMenu
-				return m, nil
-			case "up", "k":
-				if m.cursorTool > 0 {
-					m.cursorTool--
-				}
-			case "down", "j":
-				if m.cursorTool < len(m.curTools)-1 {
-					m.cursorTool++
-				}
-			case "+", "t": // trim to ≤300
+            case modeDesc:
+                switch k {
+                case "q", "ctrl+c":
+                    m.overlay = nil
+                    return m, tea.Quit
+                case "b", "esc", "enter":
+                    m.mode = modeMenu
+                    return m, nil
+                case "?":
+                    m.showHelp = !m.showHelp
+                    return m, nil
+            case "e": // edit description in simple textarea
+                if len(m.curTools) > 0 {
+                    t := m.curTools[m.cursorTool]
+                    oxr := ""
+                    if mm := m.overlay.Descriptions[m.curServer]; mm != nil {
+                        oxr = mm[t]
+                    }
+                    if oxr != "" {
+                        m.editBuffer = oxr
+                    } else {
+                        raw := m.origDesc[m.curServer][t]
+                        m.editBuffer = trim300(raw)
+                    }
+                    m.mode = modeDescEdit
+                }
+                return m, nil
+            case "up", "k":
+                if m.cursorTool > 0 {
+                    m.cursorTool--
+                }
+            case "down", "j":
+                if m.cursorTool < len(m.curTools)-1 {
+                    m.cursorTool++
+                }
+            case "+", "t": // trim to ≤300
 				if len(m.curTools) > 0 {
 					t := m.curTools[m.cursorTool]
 					raw := m.origDesc[m.curServer][t]
@@ -327,37 +388,69 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 			}
-		case modeDiff:
-			switch k {
-			case "b", "esc", "enter", "q", "ctrl+c":
-				// always return to desc view
-				m.mode = modeDesc
-				return m, nil
-			}
-		case modeLaunch:
-			switch k {
-			case "q", "ctrl+c":
-				m.overlay = nil
-				return m, tea.Quit
-			case "b", "esc":
-				m.mode = modeList
-				return m, nil
-			case "left", "right":
-				if m.launch == "mcpo" {
-					m.launch = "raw"
-				} else {
-					m.launch = "mcpo"
-				}
-				return m, nil
-			case "1":
-				m.launch = "mcpo"
-				return m, nil
-			case "2":
-				m.launch = "raw"
-				return m, nil
-			case "enter":
-				return m, tea.Quit
-			}
+            case modeDescEdit:
+                switch k {
+                case "q", "ctrl+c":
+                    m.overlay = nil
+                    return m, tea.Quit
+                case "b", "esc":
+                    m.mode = modeDesc
+                    return m, nil
+                case "?":
+                    m.showHelp = !m.showHelp
+                    return m, nil
+            case "enter":
+                if len(m.curTools) > 0 {
+                    t := m.curTools[m.cursorTool]
+                    if m.overlay.Descriptions[m.curServer] == nil {
+                        m.overlay.Descriptions[m.curServer] = map[string]string{}
+                    }
+                    m.overlay.Descriptions[m.curServer][t] = strings.TrimSpace(m.editBuffer)
+                }
+                m.mode = modeDesc
+                return m, nil
+            default:
+                // basic text input
+                if msg.Type == tea.KeyBackspace || msg.Type == tea.KeyCtrlH {
+                    if n := len([]rune(m.editBuffer)); n > 0 {
+                        r := []rune(m.editBuffer)
+                        m.editBuffer = string(r[:n-1])
+                    }
+                } else if msg.Type == tea.KeyRunes {
+                    m.editBuffer += string(msg.Runes)
+                }
+                return m, nil
+            }
+            case modeDiff:
+                switch k {
+                case "b", "esc", "enter", "q", "ctrl+c":
+                    // always return to desc view
+                    m.mode = modeDesc
+                    return m, nil
+                case "?":
+                    m.showHelp = !m.showHelp
+                    return m, nil
+            }
+            case modeLaunch:
+                switch k {
+                case "q", "ctrl+c":
+                    m.overlay = nil
+                    return m, tea.Quit
+                case "b", "esc":
+                    m.mode = modeList
+                    return m, nil
+                case "?":
+                    m.showHelp = !m.showHelp
+                    return m, nil
+                case "up", "k", "1":
+                    m.launch = "mcpo"
+                    return m, nil
+                case "down", "j", "2":
+                    m.launch = "raw"
+                    return m, nil
+                case "enter":
+                    return m, tea.Quit
+                }
 		}
 	default:
 		return m, nil
@@ -368,15 +461,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 /* ===== Views ===== */
 
 var (
-	titleStyle   = lipgloss.NewStyle().Bold(true)
-	selStyle     = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "205", Dark: "213"}).Bold(true)
-	faintStyle   = lipgloss.NewStyle().Faint(true)
-	tagStyle     = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "238", Dark: "245"}).Background(lipgloss.AdaptiveColor{Light: "250", Dark: "238"}).Padding(0, 1)
-	tagWarnStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "160", Dark: "203"}).Padding(0, 1)
+    titleStyle   = lipgloss.NewStyle().Bold(true)
+    selStyle     = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "205", Dark: "213"}).Bold(true)
+    faintStyle   = lipgloss.NewStyle().Faint(true)
+    tagStyle     = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "238", Dark: "245"}).Background(lipgloss.AdaptiveColor{Light: "250", Dark: "238"}).Padding(0, 1)
+    tagWarnStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "160", Dark: "203"}).Padding(0, 1)
 )
 
+func init() {
+    // Basic no-color fallback for dumb terminals or NO_COLOR env
+    if os.Getenv("NO_COLOR") != "" || strings.Contains(strings.ToLower(os.Getenv("TERM")), "dumb") {
+        titleStyle = lipgloss.NewStyle()
+        selStyle = lipgloss.NewStyle()
+        faintStyle = lipgloss.NewStyle()
+        tagStyle = lipgloss.NewStyle()
+        tagWarnStyle = lipgloss.NewStyle()
+    }
+}
+
 func (m model) View() string {
-	switch m.mode {
+    if m.showHelp {
+        return m.viewHelp()
+    }
+    switch m.mode {
 	case modeList:
 		return m.viewList()
 	case modeMenu:
@@ -385,45 +492,74 @@ func (m model) View() string {
 		return m.viewSelect("Allowed tools (space to toggle, enter to save)")
 	case modeDeny:
 		return m.viewSelect("Disallowed tools (space to toggle, enter to save)")
-	case modeDesc:
-		return m.viewDesc()
-	case modeDiff:
-		return m.viewDiff()
-	case modeLaunch:
-		return m.viewLaunch()
-	default:
-		return ""
-	}
+    case modeDesc:
+        return m.viewDesc()
+    case modeDiff:
+        return m.viewDiff()
+    case modeDescEdit:
+        return m.viewDescEdit()
+    case modeLaunch:
+        return m.viewLaunch()
+    default:
+        return ""
+    }
 }
 
 func (m model) viewList() string {
-	var b strings.Builder
-	b.WriteString(titleStyle.Render("MCP servers (per config)") + "\n")
-	if len(m.names) == 0 {
-		b.WriteString("No servers found.\n")
-	} else {
-		for i, name := range m.names {
-			// show disabled badge if set
-			line := "  " + name
-			if m.overlay.Disabled[name] {
-				line += " " + tagWarnStyle.Render("DISABLED")
-			}
-			if i == m.cursorServer {
-				line = selStyle.Render("> " + line[2:])
-			}
-			b.WriteString(line + "\n")
-		}
-	}
-	b.WriteString("\nEnter: edit server   c: continue   q: quit\n")
-	return b.String()
+    var b strings.Builder
+    if m.overlay == nil {
+        return ""
+    }
+    b.WriteString(titleStyle.Render("MCP servers (per config)") + "\n")
+    if len(m.names) == 0 {
+        b.WriteString("No servers found.\n")
+    } else {
+        for i, name := range m.names {
+            // show disabled badge if set
+            line := "  " + name
+            if m.status[name] == StatusERR {
+                line += " " + tagWarnStyle.Render("ERR")
+            } else if m.status[name] == StatusHTTP {
+                line += " " + tagStyle.Render("HTTP")
+            }
+            if m.overlay.Disabled[name] {
+                line += " " + tagWarnStyle.Render("DISABLED")
+            }
+            if i == m.cursorServer {
+                line = selStyle.Render("> " + line[2:])
+            }
+            b.WriteString(line + "\n")
+        }
+    }
+    b.WriteString("\nEnter/d: details   c: continue   q: quit\n")
+    return b.String()
 }
 
 func (m model) viewMenu() string {
-	var b strings.Builder
-	b.WriteString(titleStyle.Render(fmt.Sprintf("Server: %s", m.curServer)) + "\n\n")
-	b.WriteString("1) Edit allowed tools   (a)\n")
-	b.WriteString("2) Edit disallowed tools (d)\n")
-	b.WriteString("3) Edit tool descriptions (+ trim ≤300, - clear, d diff)\n")
+    var b strings.Builder
+    if m.overlay == nil {
+        return ""
+    }
+    b.WriteString(titleStyle.Render(fmt.Sprintf("Server: %s", m.curServer)) + "\n\n")
+    // show status & error details if present
+    if st, ok := m.status[m.curServer]; ok {
+        switch st {
+        case StatusERR:
+            b.WriteString(tagWarnStyle.Render("ERR") + "\n")
+            if msg, ok2 := m.errors[m.curServer]; ok2 && strings.TrimSpace(msg) != "" {
+                b.WriteString(faintStyle.Render(msg) + "\n\n")
+            } else {
+                b.WriteString(faintStyle.Render("No error details available") + "\n\n")
+            }
+        case StatusHTTP:
+            b.WriteString(tagStyle.Render("HTTP (not yet implemented)") + "\n\n")
+        case StatusOK:
+            // no extra tag for OK
+        }
+    }
+    b.WriteString("1) Edit allowed tools   (a)\n")
+    b.WriteString("2) Edit disallowed tools (d)\n")
+    b.WriteString("3) Edit tool descriptions (+ trim ≤300, - clear, d diff)\n")
 	toggle := "Disable"
 	if m.overlay.Disabled[m.curServer] {
 		toggle = "Enable (currently disabled)"
@@ -433,9 +569,23 @@ func (m model) viewMenu() string {
 	return b.String()
 }
 
+func (m model) viewHelp() string {
+    var b strings.Builder
+    b.WriteString(titleStyle.Render("Help — Key Bindings") + "\n\n")
+    b.WriteString("Global: q/ctrl+c quit   b/esc back   ? toggle help\n\n")
+    b.WriteString("List: ↑/k, ↓/j, enter/d details, c choose launch\n")
+    b.WriteString("Menu: 1 allow, 2 deny, 3 descriptions, 4 disable\n")
+    b.WriteString("Allow/Deny: ↑/k, ↓/j, space toggle, enter save\n")
+    b.WriteString("Desc: + trim ≤300, - clear, d diff, e edit\n")
+    b.WriteString("Diff: enter/b back\n")
+    b.WriteString("Launch: ↑/k mcpo, ↓/j raw, enter confirm\n")
+    b.WriteString("\n?: close help\n")
+    return b.String()
+}
+
 func (m *model) prepareToolEditor(presetAll bool) {
-	tools := m.servers[m.curServer]
-	m.curTools = make([]string, 0, len(tools))
+    tools := m.servers[m.curServer]
+    m.curTools = make([]string, 0, len(tools))
 	for _, t := range tools {
 		m.curTools = append(m.curTools, t.Name)
 	}
@@ -463,7 +613,10 @@ func (m *model) prepareToolEditor(presetAll bool) {
 }
 
 func (m model) viewSelect(title string) string {
-	var b strings.Builder
+    var b strings.Builder
+    if m.overlay == nil {
+        return ""
+    }
 	b.WriteString(titleStyle.Render(fmt.Sprintf("%s — %s", title, m.curServer)) + "\n")
 	for i, t := range m.curTools {
 		check := "[ ]"
@@ -481,10 +634,13 @@ func (m model) viewSelect(title string) string {
 }
 
 func (m model) viewDesc() string {
-	var b strings.Builder
-	b.WriteString(titleStyle.Render(fmt.Sprintf("Descriptions — %s", m.curServer)) + "\n")
-	cur := m.curTools
-	for i, t := range cur {
+    var b strings.Builder
+    if m.overlay == nil {
+        return ""
+    }
+    b.WriteString(titleStyle.Render(fmt.Sprintf("Descriptions — %s", m.curServer)) + "\n")
+    cur := m.curTools
+    for i, t := range cur {
 		raw := m.origDesc[m.curServer][t]
 		badges := make([]string, 0, 2)
 		oxr := ""
@@ -511,12 +667,34 @@ func (m model) viewDesc() string {
 		}
 		b.WriteString(line + "\n")
 	}
-	b.WriteString("\n+: trim ≤300   -: clear override   d: view diff   enter/b: back   q: quit\n")
-	return b.String()
+    b.WriteString("\n+: trim ≤300   -: clear override   d: view diff   enter/b: back   q: quit\n")
+    return b.String()
+}
+
+func (m model) viewDescEdit() string {
+    var b strings.Builder
+    if m.overlay == nil {
+        return ""
+    }
+    b.WriteString(titleStyle.Render(fmt.Sprintf("Edit Description — %s", m.curServer)) + "\n")
+    if len(m.curTools) > 0 {
+        t := m.curTools[m.cursorTool]
+        b.WriteString(faintStyle.Render("Tool: ") + t + "\n\n")
+    }
+    if strings.TrimSpace(m.editBuffer) == "" {
+        b.WriteString(faintStyle.Render("<type to edit>") + "\n")
+    } else {
+        b.WriteString(m.editBuffer + "\n")
+    }
+    b.WriteString("\nenter: save   b/esc: cancel   q: quit\n")
+    return b.String()
 }
 
 func (m model) viewDiff() string {
-	var b strings.Builder
+    var b strings.Builder
+    if m.overlay == nil {
+        return ""
+    }
 	title := fmt.Sprintf("Diff — %s", m.curServer)
 	b.WriteString(titleStyle.Render(title) + "\n\n")
 	if m.diffBefore == "" && m.diffAfter == "" {
@@ -524,24 +702,32 @@ func (m model) viewDiff() string {
 		b.WriteString("\nenter/b: back\n")
 		return b.String()
 	}
-	b.WriteString(tagStyle.Render("RAW") + "\n")
-	if m.diffBefore == "" {
-		b.WriteString(faintStyle.Render("<empty>") + "\n\n")
-	} else {
-		b.WriteString(m.diffBefore + "\n\n")
-	}
-	b.WriteString(tagStyle.Render("OVERRIDE") + "\n")
-	if m.diffAfter == "" {
-		b.WriteString(faintStyle.Render("<none set>") + "\n")
-	} else {
-		b.WriteString(m.diffAfter + "\n")
-	}
+    b.WriteString(tagStyle.Render("RAW") + "\n")
+    if m.diffBefore == "" {
+        b.WriteString(faintStyle.Render("<empty>") + "\n\n")
+    } else {
+        for _, ln := range strings.Split(m.diffBefore, "\n") {
+            b.WriteString(tagWarnStyle.Render("- ") + ln + "\n")
+        }
+        b.WriteString("\n")
+    }
+    b.WriteString(tagStyle.Render("OVERRIDE") + "\n")
+    if m.diffAfter == "" {
+        b.WriteString(faintStyle.Render("<none set>") + "\n")
+    } else {
+        for _, ln := range strings.Split(m.diffAfter, "\n") {
+            b.WriteString(tagStyle.Render("+ ") + ln + "\n")
+        }
+    }
 	b.WriteString("\nenter/b: back\n")
 	return b.String()
 }
 
 func (m model) viewLaunch() string {
-	var b strings.Builder
+    var b strings.Builder
+    if m.overlay == nil {
+        return ""
+    }
 	b.WriteString(titleStyle.Render("Choose how to launch servers") + "\n")
 	cur1, cur2 := " ", " "
 	if m.launch == "mcpo" {
@@ -550,9 +736,9 @@ func (m model) viewLaunch() string {
 		cur2 = ">"
 	}
 	b.WriteString(fmt.Sprintf("%s mcpo (HTTP + OpenAPI, recommended)\n", cur1))
-	b.WriteString(fmt.Sprintf("%s raw (stdio only)\n\n", cur2))
-	b.WriteString("←/→ switch   enter: confirm   b: back   q: quit\n")
-	return b.String()
+    b.WriteString(fmt.Sprintf("%s raw (stdio only)\n\n", cur2))
+    b.WriteString("↑/↓ select   enter: confirm   b: back   q: quit\n")
+    return b.String()
 }
 
 func (m *model) launchMode() string {
