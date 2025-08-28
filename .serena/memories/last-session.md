@@ -1,0 +1,1 @@
+All steering docs and spec (requirements, design with code TUI appendix, tasks) for ‘tui-preflight-ux’ approved and approvals cleaned. Implementation intentionally deferred at user request. Ready to implement later using tasks.md.
