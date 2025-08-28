@@ -396,10 +396,16 @@ func cmdUp() {
     // --- PREFLIGHT: inspect tools per instance/server ---
     // Composite key format for TUI: "<inst>/<server>"
     type preflight struct {
-        ByComposite map[string][]mcpclient.Tool
+        ByComposite map[string][]mcpclient.Tool // "<inst>/<srv>" -> tools (may be empty on error)
+        Status      map[string]appTUI.ServerStatus     // "<inst>/<srv>" -> status (OK/ERR/...)
+        Errs        map[string]string           // "<inst>/<srv>" -> error text (if any)
     }
 
-    pf := preflight{ByComposite: map[string][]mcpclient.Tool{}}
+    pf := preflight{
+        ByComposite: map[string][]mcpclient.Tool{},
+        Status:      map[string]appTUI.ServerStatus{},
+        Errs:        map[string]string{},
+    }
     for i := range instances {
         inst := &instances[i]
         cfg := readConfig(inst.ConfigPath)
@@ -407,13 +413,18 @@ func cmdUp() {
             ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
             sum, err := mcpclient.InspectServer(ctx, sname, srv)
             cancel()
-            if err != nil && verbosity > 0 {
-                fmt.Printf("[preflight#%s] %s: %v\n", inst.Name, sname, err)
+            key := inst.Name + "/" + sname
+            if err != nil {
+                if verbosity > 0 {
+                    fmt.Printf("[preflight#%s] %s: %v\n", inst.Name, sname, err)
+                }
+                pf.Status[key] = appTUI.StatusERR
+                pf.Errs[key] = err.Error()
+            } else {
+                pf.Status[key] = appTUI.StatusOK
             }
-            if len(sum.Tools) > 0 {
-                key := inst.Name + "/" + sname
-                pf.ByComposite[key] = sum.Tools
-            }
+            // Always include the server in the composite map, even when tools could not be listed.
+            pf.ByComposite[key] = sum.Tools
         }
     }
 
@@ -424,20 +435,20 @@ func cmdUp() {
     var nestedOverlay *Overlay
     launchMode := "mcpo"
     if *useTUI {
-        ovComposite, mode, err := appTUI.Run(pf.ByComposite, seed)
+        ovComposite, mode, err := appTUI.Run(pf.ByComposite, seed, pf.Status, pf.Errs)
         if err != nil {
-            fmt.Println("TUI error:", err)
-        } else {
-            if ovComposite == nil {
-                fmt.Println("Cancelled.")
-                return
-            }
-            // Persist (composite form) so the next TUI run preloads selections.
-            saveOverridesComposite(ovComposite)
-            // Convert to nested overlay (per instance) for the launcher/merger.
-            nestedOverlay = translateOverlay(instances, ovComposite)
-            launchMode = mode
+            fmt.Println("Cancelled — no servers launched (TUI error):", err)
+            return
         }
+        if ovComposite == nil {
+            fmt.Println("Cancelled — no servers launched")
+            return
+        }
+        // Persist (composite form) so the next TUI run preloads selections.
+        saveOverridesComposite(ovComposite)
+        // Convert to nested overlay (per instance) for the launcher/merger.
+        nestedOverlay = translateOverlay(instances, ovComposite)
+        launchMode = mode
     } else {
         // No TUI: still apply any persisted overrides (composite → nested).
         if seed != nil {
@@ -594,21 +605,21 @@ func cmdUp() {
         runs = append(runs, &running{inst: inst, proxy: proxy, mcpo: mcpoCmd})
     }
 
-    // Minimal “important” output
+    // Results summary (styled + copy-friendly)
     fmt.Println()
     if len(runs) == 0 {
         fmt.Println("No stacks started.")
         return
     }
-    fmt.Println("=== SHARE THESE WITH CHATGPT (Actions → Import from URL) ===")
+    fmt.Println("== Results (share with ChatGPT: Actions → Import from URL) ==")
     for idx, r := range runs {
         inst := r.inst
         url := inst.PublicURL
         if url == "" {
             url = fmt.Sprintf("http://127.0.0.1:%d", inst.FrontPort)
         }
-        fmt.Printf("%d) %s/openapi.json  (config: %s)\n", idx+1, url, shortPath(inst.ConfigPath))
-        fmt.Printf("   X-API-Key: %s\n", inst.APIKey)
+        fmt.Printf("%d) %-40s  (config: %s)\n", idx+1, url+"/openapi.json", shortPath(inst.ConfigPath))
+        fmt.Printf("    %-16s %s\n", "X-API-Key:", maskKey(inst.APIKey))
         warn := ""
         switch {
         case inst.OperationCount > 30:
@@ -616,8 +627,8 @@ func cmdUp() {
         case inst.OperationCount >= 28:
             warn = "  ⚠ near 30"
         }
-        fmt.Printf("   MCP servers: %d\n", len(inst.ToolNames))
-        fmt.Printf("   Endpoints (OpenAPI operations): %d%s\n", inst.OperationCount, warn)
+        fmt.Printf("    %-16s %d\n", "MCP servers:", len(inst.ToolNames))
+        fmt.Printf("    %-16s %d%s\n", "Endpoints:", inst.OperationCount, warn)
         // Per-server tool count + long description warning (summary only)
         if len(inst.ServerOpCounts) > 0 {
             names := mapsKeys(inst.ServerOpCounts)
@@ -643,6 +654,11 @@ func cmdUp() {
                 fmt.Printf("     (run with -v to see specific tools exceeding 300-char description limit)\n")
             }
         }
+        // Copy-friendly block
+        fmt.Println("    --- copy ---")
+        fmt.Printf("    OPENAPI=%s\n", url+"/openapi.json")
+        fmt.Printf("    API_KEY=%s\n", inst.APIKey)
+        fmt.Println()
     }
 
     // Detailed description-length warnings (only in verbose modes)
@@ -1896,4 +1912,14 @@ func mapsKeys[K comparable, V any](m map[K]V) []K {
         ks = append(ks, k)
     }
     return ks
+}
+
+func maskKey(s string) string {
+    r := []rune(s)
+    n := len(r)
+    if n <= 6 {
+        if n == 0 { return "" }
+        return strings.Repeat("*", n)
+    }
+    return string(r[:4]) + strings.Repeat("*", n-6) + string(r[n-2:])
 }
