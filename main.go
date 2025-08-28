@@ -325,7 +325,28 @@ func cmdUp() {
     ensureStateDir()
     st := loadState()
 
-    // Which configs?
+    // Which configs? If TUI requested and none provided, collect via TUI.
+    if *useTUI && len(configs) == 0 {
+        v := 0
+        if *debug { v = 2 } else if *verbose { v = 1 }
+        cfgs, fport, mcport, outTunnel, outName, outVerb, ok, err := appTUI.CollectConfigs(nil, *port, *mcpoPort, *tunnel, *tunnelName, v)
+        if err != nil {
+            fmt.Println("Cancelled — no servers launched (TUI error):", err)
+            return
+        }
+        if !ok {
+            fmt.Println("Cancelled — no servers launched")
+            return
+        }
+        // apply collected settings
+        for _, c := range cfgs { configs = append(configs, c) }
+        *port = fport
+        *mcpoPort = mcport
+        *tunnel = outTunnel
+        *tunnelName = outName
+        *debug = outVerb == 2
+        *verbose = outVerb == 1
+    }
     if len(configs) == 0 {
         configs = append(configs, defaultConfig)
     }
@@ -406,6 +427,9 @@ func cmdUp() {
         Status:      map[string]appTUI.ServerStatus{},
         Errs:        map[string]string{},
     }
+    var logCh chan string
+    if *useTUI { logCh = make(chan string, 2048) }
+
     for i := range instances {
         inst := &instances[i]
         cfg := readConfig(inst.ConfigPath)
@@ -449,6 +473,16 @@ func cmdUp() {
         // Convert to nested overlay (per instance) for the launcher/merger.
         nestedOverlay = translateOverlay(instances, ovComposite)
         launchMode = mode
+        // If TUI stored a tunnel preference in LastLaunch ("none"|"quick"|"named"), honor it by overriding --tunnel values.
+        if ovComposite != nil {
+            switch strings.ToLower(strings.TrimSpace(ovComposite.LastLaunch)) {
+            case "none", "quick", "named":
+                // Apply to each planned instance
+                for i := range instances {
+                    instances[i].TunnelMode = ovComposite.LastLaunch
+                }
+            }
+        }
     } else {
         // No TUI: still apply any persisted overrides (composite → nested).
         if seed != nil {
@@ -482,6 +516,135 @@ func cmdUp() {
     runs := make([]*running, 0, len(instances))
     namedStarted := false
 
+    // If using TUI, launch Results immediately and update live
+    if *useTUI {
+        logCh := make(chan string, 2048)
+        updCh := make(chan appTUI.ResultUpdate, 128)
+        // initial items (skeleton)
+        items := make([]appTUI.ResultInstance, 0, len(instances))
+        for i := range instances {
+            inst := &instances[i]
+            base := inst.PublicURL
+            if base == "" { base = fmt.Sprintf("http://127.0.0.1:%d", inst.FrontPort) }
+            items = append(items, appTUI.ResultInstance{
+                Name:         inst.Name,
+                OpenAPI:      base + "/openapi.json",
+                APIKeyMasked: maskKey(inst.APIKey),
+                APIKeyRaw:    inst.APIKey,
+                ServersCount: 0,
+                Endpoints:    0,
+                ConfigPath:   shortPath(inst.ConfigPath),
+            })
+        }
+        // Launch workers in background
+        go func() {
+            // Start stacks as before, but stream logs and send updates as info becomes available
+            for i := range instances {
+                inst := &instances[i]
+
+                // Start mcpo
+                mcpoCmd := exec.Command(findBinary("mcpo"),
+                    "--port", fmt.Sprint(inst.McpoPort),
+                    "--api-key", inst.APIKey,
+                    "--config", inst.ConfigPath,
+                    "--hot-reload",
+                )
+                if runtime.GOOS != "windows" {
+                    mcpoCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+                }
+                stdout, _ := mcpoCmd.StdoutPipe()
+                stderr, _ := mcpoCmd.StderrPipe()
+                if err := mcpoCmd.Start(); err != nil {
+                    if logCh != nil { logCh <- fmt.Sprintf("[start#%s] failed to start mcpo: %v", inst.Name, err) }
+                    continue
+                }
+                inst.McpoPID = mcpoCmd.Process.Pid
+                saveStateMulti(&st, instances)
+                tag := "mcpo#" + inst.Name
+                go scanAndMaybeStream(tag, stdout, false, lf, func(line string){ select { case logCh<-"["+tag+"] "+line: default: }})
+                go scanAndMaybeStream(tag, stderr, false, lf, func(line string){ select { case logCh<-"["+tag+"] "+line: default: }})
+                waitURL(fmt.Sprintf("http://127.0.0.1:%d/docs", inst.McpoPort), 60*time.Second)
+
+                // Record MCP server names
+                cfg := readConfig(inst.ConfigPath)
+                var toolNames []string
+                for name := range cfg.MCPServers {
+                    if nestedOverlay != nil && nestedOverlay.Disabled != nil && nestedOverlay.Disabled[inst.Name] != nil && nestedOverlay.Disabled[inst.Name][name] { continue }
+                    toolNames = append(toolNames, name)
+                }
+                sort.Strings(toolNames)
+                inst.ToolNames = toolNames
+                saveStateMulti(&st, instances)
+
+                // Front proxy
+                proxy := newFrontProxy(inst.FrontPort, inst.McpoPort)
+                go func(name string, fp *frontProxy) { _ = fp.Serve() }(inst.Name, proxy)
+
+                // Tunnel
+                switch inst.TunnelMode {
+                case "quick":
+                    u := startQuickTunnel("cloudflared#"+inst.Name, inst.FrontPort, false, lf, logCh)
+                    if u != "" { inst.PublicURL = u; saveStateMulti(&st, instances) }
+                case "named":
+                    if !namedStarted {
+                        pid := startNamedTunnel("cloudflared#"+inst.Name, inst.TunnelName, false, lf, logCh)
+                        inst.CloudflaredPID = pid
+                        saveStateMulti(&st, instances)
+                        namedStarted = true
+                    }
+                }
+
+                // Merge OpenAPI and update counts
+                baseURL := inst.PublicURL
+                if baseURL == "" { baseURL = fmt.Sprintf("http://127.0.0.1:%d", inst.FrontPort) }
+                spec, perServerWarns, perServerCounts, err := mergeOpenAPI(*inst, baseURL, nestedOverlay)
+                if err == nil {
+                    inst.OperationCount = countOperations(spec)
+                    inst.ServerWarns = perServerWarns
+                    inst.ServerOpCounts = perServerCounts
+                    inst.ServerLongDescCounts = map[string]int{}
+                    for sname, ws := range perServerWarns { inst.ServerLongDescCounts[sname] = len(ws) }
+                    saveStateMulti(&st, instances)
+                    proxy.SetOpenAPI(spec)
+                } else {
+                    if logCh != nil { logCh <- fmt.Sprintf("[openapi#%s] merge failed: %v", inst.Name, err) }
+                }
+
+                // Update results item
+                updCh <- appTUI.ResultUpdate{
+                    Idx: i,
+                    OpenAPI: baseURL+"/openapi.json",
+                    APIKeyMasked: maskKey(inst.APIKey),
+                    APIKeyRaw: inst.APIKey,
+                    ServersCount: len(inst.ToolNames),
+                    Endpoints: inst.OperationCount,
+                    PerServerCounts: inst.ServerOpCounts,
+                    LongDescCounts: inst.ServerLongDescCounts,
+                    ConfigPath: shortPath(inst.ConfigPath),
+                }
+
+                runs = append(runs, &running{inst: inst, proxy: proxy, mcpo: mcpoCmd})
+            }
+            close(updCh)
+        }()
+
+        // Block on live results; cleanup happens after exit below
+        _ = appTUI.ShowResultsLive(items, logCh, updCh)
+        // Cleanup after user exits TUI
+        for _, r := range runs {
+            ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+            _ = r.proxy.Close(ctx)
+            cancel()
+        }
+        for i := range instances {
+            inst := &instances[i]
+            if inst.CloudflaredPID > 0 { _ = killPID(inst.CloudflaredPID); inst.CloudflaredPID = 0 }
+            if inst.McpoPID > 0 { _ = killProcessGroup(inst.McpoPID); inst.McpoPID = 0 }
+        }
+        saveStateMulti(&st, instances)
+        return
+    }
+
     for i := range instances {
         inst := &instances[i]
 
@@ -504,8 +667,12 @@ func cmdUp() {
         inst.McpoPID = mcpoCmd.Process.Pid
         saveStateMulti(&st, instances)
         tag := "mcpo#" + inst.Name
-        go scanAndMaybeStream(tag, stdout, streamProcs, lf, nil)
-        go scanAndMaybeStream(tag, stderr, streamProcs, lf, nil)
+        var onLine func(string)
+        if *useTUI && logCh != nil {
+            onLine = func(line string) { select { case logCh <- "["+tag+"] "+line: default: } }
+        }
+        go scanAndMaybeStream(tag, stdout, streamProcs && !*useTUI, lf, onLine)
+        go scanAndMaybeStream(tag, stderr, streamProcs && !*useTUI, lf, onLine)
         waitURL(fmt.Sprintf("http://127.0.0.1:%d/docs", inst.McpoPort), 60*time.Second)
 
         // Record MCP server names from config (honor overlay disables)
@@ -525,18 +692,20 @@ func cmdUp() {
         // Front proxy
         proxy := newFrontProxy(inst.FrontPort, inst.McpoPort)
         go func(name string, fp *frontProxy) {
-            if err := fp.Serve(); err != nil && !errors.Is(err, http.ErrServerClosed) && streamProcs {
+            if err := fp.Serve(); err != nil && !errors.Is(err, http.ErrServerClosed) && streamProcs && !*useTUI {
                 fmt.Printf("[front#%s] error: %v\n", name, err)
             }
         }(inst.Name, proxy)
         if verbosity > 0 {
-            fmt.Printf("[front#%s] http://127.0.0.1:%d\n", inst.Name, inst.FrontPort)
+            if !*useTUI {
+                fmt.Printf("[front#%s] http://127.0.0.1:%d\n", inst.Name, inst.FrontPort)
+            }
         }
 
         // Cloudflare tunnel (strictly honor selection)
         switch inst.TunnelMode {
         case "quick":
-            u := startQuickTunnel("cloudflared#"+inst.Name, inst.FrontPort, streamProcs, lf)
+            u := startQuickTunnel("cloudflared#"+inst.Name, inst.FrontPort, streamProcs && !*useTUI, lf, logCh)
             if u == "" {
                 if verbosity > 0 {
                     fmt.Printf("[tunnel#%s] Quick Tunnel failed; continuing without a public URL.\n", inst.Name)
@@ -546,7 +715,7 @@ func cmdUp() {
                 saveStateMulti(&st, instances)
             }
         case "named":
-            if inst.PublicURL == "" && verbosity > 0 {
+            if inst.PublicURL == "" && verbosity > 0 && !*useTUI {
                 fmt.Printf("[tunnel#%s] Named tunnel selected but --public-url not provided. Please pass --public-url https://your.host\n", inst.Name)
             }
             if namedStarted {
@@ -555,7 +724,7 @@ func cmdUp() {
                 }
                 break
             }
-            pid := startNamedTunnel("cloudflared#"+inst.Name, inst.TunnelName, streamProcs, lf)
+            pid := startNamedTunnel("cloudflared#"+inst.Name, inst.TunnelName, streamProcs && !*useTUI, lf, logCh)
             inst.CloudflaredPID = pid
             saveStateMulti(&st, instances)
             namedStarted = true
@@ -574,7 +743,11 @@ func cmdUp() {
         }
         spec, perServerWarns, perServerCounts, err := mergeOpenAPI(*inst, baseURL, nestedOverlay)
         if err != nil {
-            fmt.Printf("[openapi#%s] merge failed: %v\n", inst.Name, err)
+            if !*useTUI {
+                fmt.Printf("[openapi#%s] merge failed: %v\n", inst.Name, err)
+            } else if logCh != nil {
+                logCh <- fmt.Sprintf("[openapi#%s] merge failed: %v", inst.Name, err)
+            }
         } else {
             inst.OperationCount = countOperations(spec)
             inst.ServerWarns = perServerWarns
@@ -587,16 +760,14 @@ func cmdUp() {
 
             // quick sanity check: dangling component refs?
             if warns := findDanglingComponentRefs(spec); len(warns) > 0 {
-                fmt.Printf("[openapi#%s] WARNING: unresolved $ref targets detected:\n", inst.Name)
-                max := warns
-                if len(max) > 8 {
-                    max = max[:8]
-                }
-                for _, w := range max {
-                    fmt.Println("  -", w)
-                }
-                if len(warns) > len(max) {
-                    fmt.Printf("  … and %d more\n", len(warns)-len(max))
+                if !*useTUI {
+                    fmt.Printf("[openapi#%s] WARNING: unresolved $ref targets detected:\n", inst.Name)
+                    max := warns
+                    if len(max) > 8 { max = max[:8] }
+                    for _, w := range max { fmt.Println("  -", w) }
+                    if len(warns) > len(max) { fmt.Printf("  … and %d more\n", len(warns)-len(max)) }
+                } else if logCh != nil {
+                    logCh <- fmt.Sprintf("[openapi#%s] WARNING: unresolved $ref targets detected (%d)", inst.Name, len(warns))
                 }
             }
             proxy.SetOpenAPI(spec)
@@ -605,60 +776,84 @@ func cmdUp() {
         runs = append(runs, &running{inst: inst, proxy: proxy, mcpo: mcpoCmd})
     }
 
-    // Results summary (styled + copy-friendly)
-    fmt.Println()
-    if len(runs) == 0 {
-        fmt.Println("No stacks started.")
-        return
-    }
-    fmt.Println("== Results (share with ChatGPT: Actions → Import from URL) ==")
-    for idx, r := range runs {
-        inst := r.inst
-        url := inst.PublicURL
-        if url == "" {
-            url = fmt.Sprintf("http://127.0.0.1:%d", inst.FrontPort)
-        }
-        fmt.Printf("%d) %-40s  (config: %s)\n", idx+1, url+"/openapi.json", shortPath(inst.ConfigPath))
-        fmt.Printf("    %-16s %s\n", "X-API-Key:", maskKey(inst.APIKey))
-        warn := ""
-        switch {
-        case inst.OperationCount > 30:
-            warn = "  ⚠ OVER 30-limit"
-        case inst.OperationCount >= 28:
-            warn = "  ⚠ near 30"
-        }
-        fmt.Printf("    %-16s %d\n", "MCP servers:", len(inst.ToolNames))
-        fmt.Printf("    %-16s %d%s\n", "Endpoints:", inst.OperationCount, warn)
-        // Per-server tool count + long description warning (summary only)
-        if len(inst.ServerOpCounts) > 0 {
-            names := mapsKeys(inst.ServerOpCounts)
-            sort.Strings(names)
-            for _, sname := range names {
-                count := inst.ServerOpCounts[sname]
-                sWarn := ""
-                if count >= 30 {
-                    sWarn = "  ⚠ 30+ tools on this server"
-                }
-                long := 0
-                if inst.ServerLongDescCounts != nil {
-                    long = inst.ServerLongDescCounts[sname]
-                }
-                longMsg := ""
-                if long > 0 {
-                    longMsg = "  ⚠ tool descriptions >300"
-                }
-                fmt.Printf("     - %s: %d tools%s%s\n", sname, count, sWarn, longMsg)
-            }
-            // Detailed listing available via -v / logs
-            if verbosity == 0 {
-                fmt.Printf("     (run with -v to see specific tools exceeding 300-char description limit)\n")
-            }
-        }
-        // Copy-friendly block
-        fmt.Println("    --- copy ---")
-        fmt.Printf("    OPENAPI=%s\n", url+"/openapi.json")
-        fmt.Printf("    API_KEY=%s\n", inst.APIKey)
+    // Results summary to stdout if not using TUI
+    if !*useTUI {
         fmt.Println()
+        if len(runs) == 0 {
+            fmt.Println("No stacks started.")
+            return
+        }
+        fmt.Println("== Results (share with ChatGPT: Actions → Import from URL) ==")
+        for idx, r := range runs {
+            inst := r.inst
+            url := inst.PublicURL
+            if url == "" {
+                url = fmt.Sprintf("http://127.0.0.1:%d", inst.FrontPort)
+            }
+            fmt.Printf("%d) %-40s  (config: %s)\n", idx+1, url+"/openapi.json", shortPath(inst.ConfigPath))
+            fmt.Printf("    %-16s %s\n", "X-API-Key:", maskKey(inst.APIKey))
+            warn := ""
+            switch {
+            case inst.OperationCount > 30:
+                warn = "  ⚠ OVER 30-limit"
+            case inst.OperationCount >= 28:
+                warn = "  ⚠ near 30"
+            }
+            fmt.Printf("    %-16s %d\n", "MCP servers:", len(inst.ToolNames))
+            fmt.Printf("    %-16s %d%s\n", "Endpoints:", inst.OperationCount, warn)
+            if len(inst.ServerOpCounts) > 0 {
+                names := mapsKeys(inst.ServerOpCounts)
+                sort.Strings(names)
+                for _, sname := range names {
+                    count := inst.ServerOpCounts[sname]
+                    sWarn := ""
+                    if count >= 30 { sWarn = "  ⚠ 30+ tools on this server" }
+                    long := 0
+                    if inst.ServerLongDescCounts != nil { long = inst.ServerLongDescCounts[sname] }
+                    longMsg := ""
+                    if long > 0 { longMsg = "  ⚠ tool descriptions >300" }
+                    fmt.Printf("     - %s: %d tools%s%s\n", sname, count, sWarn, longMsg)
+                }
+                if verbosity == 0 { fmt.Printf("     (run with -v to see specific tools exceeding 300-char description limit)\n") }
+            }
+            fmt.Println("    --- copy ---")
+            fmt.Printf("    OPENAPI=%s\n", url+"/openapi.json")
+            fmt.Printf("    API_KEY=%s\n", inst.APIKey)
+            fmt.Println()
+        }
+    } else {
+        // Show Results TUI (summary + toggled logs panel)
+        items := make([]appTUI.ResultInstance, 0, len(runs))
+        for _, r := range runs {
+            inst := r.inst
+            url := inst.PublicURL
+            if url == "" { url = fmt.Sprintf("http://127.0.0.1:%d", inst.FrontPort) }
+            items = append(items, appTUI.ResultInstance{
+                Name:            inst.Name,
+                OpenAPI:         url + "/openapi.json",
+                APIKeyMasked:    maskKey(inst.APIKey),
+                APIKeyRaw:       inst.APIKey,
+                ServersCount:    len(inst.ToolNames),
+                Endpoints:       inst.OperationCount,
+                PerServerCounts: inst.ServerOpCounts,
+                LongDescCounts:  inst.ServerLongDescCounts,
+                ConfigPath:      shortPath(inst.ConfigPath),
+            })
+        }
+        _ = appTUI.ShowResults(items, streamProcs, logCh)
+        // After Results TUI exit, cleanly shut everything down and return.
+        for _, r := range runs {
+            ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+            _ = r.proxy.Close(ctx)
+            cancel()
+        }
+        for i := range instances {
+            inst := &instances[i]
+            if inst.CloudflaredPID > 0 { _ = killPID(inst.CloudflaredPID); inst.CloudflaredPID = 0 }
+            if inst.McpoPID > 0 { _ = killProcessGroup(inst.McpoPID); inst.McpoPID = 0 }
+        }
+        saveStateMulti(&st, instances)
+        return
     }
 
     // Detailed description-length warnings (only in verbose modes)
@@ -1250,7 +1445,7 @@ func (f *frontProxy) SetOpenAPI(spec []byte) {
 }
 func (f *frontProxy) Close(ctx context.Context) error { return f.srv.Shutdown(ctx) }
 
-func startQuickTunnel(tag string, frontPort int, stream bool, logFile *os.File) string {
+func startQuickTunnel(tag string, frontPort int, stream bool, logFile *os.File, logCh chan string) string {
     bin := findBinary("cloudflared")
     cmd := exec.Command(bin, "tunnel", "--url", fmt.Sprintf("http://127.0.0.1:%d", frontPort))
     stdout, _ := cmd.StdoutPipe()
@@ -1271,6 +1466,7 @@ func startQuickTunnel(tag string, frontPort int, stream bool, logFile *os.File) 
     // Parse URL from output
     urlCh := make(chan string, 1)
     parse := func(line string) {
+        if logCh != nil { select { case logCh <- "["+tag+"] "+line: default: } }
         if strings.Contains(line, "trycloudflare.com") {
             u := findFirstURL(line)
             if u != "" {
@@ -1288,7 +1484,7 @@ func startQuickTunnel(tag string, frontPort int, stream bool, logFile *os.File) 
     }
 }
 
-func startNamedTunnel(tag, name string, stream bool, logFile *os.File) int {
+func startNamedTunnel(tag, name string, stream bool, logFile *os.File, logCh chan string) int {
     args := []string{"tunnel", "run"}
     if name != "" {
         args = append(args, name)
@@ -1297,8 +1493,9 @@ func startNamedTunnel(tag, name string, stream bool, logFile *os.File) int {
     stdout, _ := cmd.StdoutPipe()
     stderr, _ := cmd.StderrPipe()
     _ = cmd.Start()
-    go scanAndMaybeStream(tag, stdout, stream, logFile, nil)
-    go scanAndMaybeStream(tag, stderr, stream, logFile, nil)
+    on := func(line string){ if logCh!=nil { select { case logCh <- "["+tag+"] "+line: default: } } }
+    go scanAndMaybeStream(tag, stdout, stream, logFile, on)
+    go scanAndMaybeStream(tag, stderr, stream, logFile, on)
     return cmd.Process.Pid
 }
 
@@ -1500,18 +1697,30 @@ func mergeOpenAPI(inst Instance, baseURL string, ov *Overlay) ([]byte, map[strin
             }
         }
 
-        // Merge paths with prefix; remove per-op security (rely on top-level).
+        // Merge paths with prefix; remove per-op security (rely on top-level) and apply allow/deny per operation.
         if p, ok := spec["paths"].(map[string]any); ok {
             for rawPath, v := range p {
-                toolName := toolNameFromRawPath(rawPath)
-                if !ov.allowed(inst.Name, name, toolName) {
-                    continue
-                }
                 newPath := "/" + strings.TrimLeft(name, "/") + ensureLeadingSlash(rawPath)
+                outItem := map[string]any{}
                 if m, ok := v.(map[string]any); ok {
                     for method, op := range m {
                         om, ok := op.(map[string]any)
                         if !ok {
+                            continue
+                        }
+                        // Heuristic for tool name
+                        toolName := toolNameFromRawPath(rawPath)
+                        if xt, ok := om["x-mcp-tool"].(string); ok && strings.TrimSpace(xt) != "" {
+                            toolName = xt
+                        } else if xt2, ok := om["x-tool"].(string); ok && strings.TrimSpace(xt2) != "" {
+                            toolName = xt2
+                        } else if oid, ok := om["operationId"].(string); ok {
+                            if i := strings.Index(oid, "__"); i > 0 {
+                                cand := oid[:i]
+                                if strings.TrimSpace(cand) != "" { toolName = cand }
+                            }
+                        }
+                        if !ov.allowed(inst.Name, name, toolName) {
                             continue
                         }
                         // operationId
@@ -1520,26 +1729,24 @@ func mergeOpenAPI(inst Instance, baseURL string, ov *Overlay) ([]byte, map[strin
                         } else {
                             om["operationId"] = name + "__" + strings.ToLower(method) + "_" + sanitizeForID(rawPath)
                         }
-                        // Description overrides (per-tool) to respect 300-char limit.
+                        // Description overrides
                         if ov != nil && ov.Descriptions != nil && ov.Descriptions[inst.Name] != nil && ov.Descriptions[inst.Name][name] != nil {
                             if d, ok := ov.Descriptions[inst.Name][name][toolName]; ok && d != "" {
                                 om["description"] = d
                             }
                         }
-                        // If still too long, record warning
                         if desc, ok := om["description"].(string); ok && len([]rune(desc)) > descLimit {
                             perServerWarns[name] = append(perServerWarns[name],
                                 fmt.Sprintf("%s %s (tool=%s): description length %d > %d",
                                     strings.ToUpper(method), newPath, toolName, len([]rune(desc)), descLimit))
                         }
-                        // Cleanup: remove per-operation security (duplicate of top-level).
                         delete(om, "security")
+                        outItem[method] = om
                     }
                 }
-                pathsOut[newPath] = v
-                // Count HTTP methods for this path item safely
-                if mm, ok2 := v.(map[string]any); ok2 {
-                    perServerCounts[name] += countHTTPMethods(mm)
+                if len(outItem) > 0 {
+                    pathsOut[newPath] = outItem
+                    perServerCounts[name] += countHTTPMethods(outItem)
                 }
             }
         }

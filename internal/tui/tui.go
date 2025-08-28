@@ -6,6 +6,8 @@ import (
     "sort"
     "strings"
     "unicode"
+    "os/exec"
+    "io/ioutil"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -65,6 +67,7 @@ const (
     modeDiff   mode = "diff"   // show before/after for current tool
     modeLaunch mode = "launch" // choose launch mode
     modeDescEdit mode = "desc_edit" // direct edit description override
+    modeDescMulti mode = "desc_multi" // multi-select actions for descriptions
 )
 
 type model struct {
@@ -82,8 +85,10 @@ type model struct {
 	curServer    string   // current composite server key
 	curTools     []string // current server's tools (names)
 
-	mode   mode
-	launch string // "mcpo" (default) or "raw"
+    mode   mode
+    launch string // "mcpo" (default) or "raw"
+    menuCursor int // selection for server menu entries
+    launchSel int  // 0 none, 1 quick, 2 named
 
 	// ephemeral selection state for allow/deny
 	editSelect map[string]bool // tool -> selected?
@@ -95,6 +100,13 @@ type model struct {
     // editor buffer for description edit
     editBuffer string
     showHelp   bool
+
+    // diff / view options
+    diffUnified bool // true=unified, false=side-by-side
+    wrapLines   bool  // soft wrap long lines in viewers
+
+    controller  string // "mcpo" or "raw"
+    termWidth   int
 }
 
 func newModel(servers map[string][]mcpclient.Tool, seed *Overlay, status map[string]ServerStatus, errs map[string]string) model {
@@ -154,6 +166,9 @@ func newModel(servers map[string][]mcpclient.Tool, seed *Overlay, status map[str
         errors:   errs,
         mode:     modeList,
         launch:   "mcpo",
+        diffUnified: true,
+        wrapLines:   true,
+        controller:  "mcpo",
     }
     if seed != nil && strings.TrimSpace(seed.LastLaunch) != "" {
         mdl.launch = seed.LastLaunch
@@ -167,6 +182,9 @@ func (m model) Init() tea.Cmd { return nil }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
     switch msg := msg.(type) {
+    case tea.WindowSizeMsg:
+        if msg.Width > 0 { m.termWidth = msg.Width }
+        return m, nil
 	case tea.KeyMsg:
 		k := strings.ToLower(msg.String())
 		switch m.mode {
@@ -196,6 +214,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                 case "c":
                     m.mode = modeLaunch
                     return m, nil
+                case "g":
+                    if m.controller == "mcpo" { m.controller = "raw" } else { m.controller = "mcpo" }
+                    return m, nil
                 }
             case modeMenu:
                 switch k {
@@ -208,25 +229,46 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                 case "?":
                     m.showHelp = !m.showHelp
                     return m, nil
-			case "1", "a": // allowed tools
-				m.prepareToolEditor(true)
-				m.mode = modeAllow
-				return m, nil
-			case "2", "d": // disallowed tools
-				m.prepareToolEditor(false)
-				m.mode = modeDeny
-				return m, nil
-			case "3": // descriptions manager
-				m.prepareToolEditor(true) // to populate curTools ordering
-				m.mode = modeDesc
-				return m, nil
-			case "4": // toggle disable/enable server
-				m.overlay.Disabled[m.curServer] = !m.overlay.Disabled[m.curServer]
-				return m, nil
-			case "c":
-				m.mode = modeLaunch
-				return m, nil
-			}
+            case "up", "k":
+                if m.menuCursor > 0 { m.menuCursor-- }
+                return m, nil
+            case "down", "j":
+                if m.menuCursor < 3 { m.menuCursor++ }
+                return m, nil
+            case "enter":
+                switch m.menuCursor {
+                case 0:
+                    m.prepareToolEditor(true)
+                    m.mode = modeAllow
+                case 1:
+                    m.prepareToolEditor(false)
+                    m.mode = modeDeny
+                case 2:
+                    m.prepareToolEditor(true)
+                    m.mode = modeDesc
+                case 3:
+                    m.overlay.Disabled[m.curServer] = !m.overlay.Disabled[m.curServer]
+                }
+                return m, nil
+            case "1", "a": // shortcuts
+                m.prepareToolEditor(true)
+                m.mode = modeAllow
+                return m, nil
+            case "2", "d":
+                m.prepareToolEditor(false)
+                m.mode = modeDeny
+                return m, nil
+            case "3":
+                m.prepareToolEditor(true)
+                m.mode = modeDesc
+                return m, nil
+            case "4":
+                m.overlay.Disabled[m.curServer] = !m.overlay.Disabled[m.curServer]
+                return m, nil
+            case "c":
+                m.mode = modeLaunch
+                return m, nil
+            }
             case modeAllow:
                 switch k {
                 case "q", "ctrl+c":
@@ -330,19 +372,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                 case "?":
                     m.showHelp = !m.showHelp
                     return m, nil
+                case "m":
+                    // enter multi-select mode (start with no selection)
+                    m.prepareToolEditor(false)
+                    m.mode = modeDescMulti
+                    return m, nil
             case "e": // edit description in simple textarea
                 if len(m.curTools) > 0 {
                     t := m.curTools[m.cursorTool]
+                    // Prefer external editor if available
+                    raw := m.origDesc[m.curServer][t]
+                    if edited, ok := tryExternalEditor(raw); ok {
+                        if m.overlay.Descriptions[m.curServer] == nil { m.overlay.Descriptions[m.curServer] = map[string]string{} }
+                        m.overlay.Descriptions[m.curServer][t] = strings.TrimSpace(edited)
+                        return m, nil
+                    }
                     oxr := ""
-                    if mm := m.overlay.Descriptions[m.curServer]; mm != nil {
-                        oxr = mm[t]
-                    }
-                    if oxr != "" {
-                        m.editBuffer = oxr
-                    } else {
-                        raw := m.origDesc[m.curServer][t]
-                        m.editBuffer = trim300(raw)
-                    }
+                    if mm := m.overlay.Descriptions[m.curServer]; mm != nil { oxr = mm[t] }
+                    if oxr != "" { m.editBuffer = oxr } else { m.editBuffer = raw }
                     m.mode = modeDescEdit
                 }
                 return m, nil
@@ -374,20 +421,74 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						}
 					}
 				}
-			case "d": // show diff panel
-				if len(m.curTools) > 0 {
-					t := m.curTools[m.cursorTool]
-					raw := m.origDesc[m.curServer][t]
-					oxr := ""
-					if mm := m.overlay.Descriptions[m.curServer]; mm != nil {
-						oxr = mm[t]
-					}
-					m.diffBefore = strings.TrimSpace(raw)
-					m.diffAfter = strings.TrimSpace(oxr)
-					m.mode = modeDiff
-					return m, nil
-				}
-			}
+                case "d": // show diff panel
+                    if len(m.curTools) > 0 {
+                        t := m.curTools[m.cursorTool]
+                        raw := m.origDesc[m.curServer][t]
+                        oxr := ""
+                        if mm := m.overlay.Descriptions[m.curServer]; mm != nil {
+                            oxr = mm[t]
+                        }
+                        m.diffBefore = strings.TrimSpace(raw)
+                        m.diffAfter = strings.TrimSpace(oxr)
+                        m.mode = modeDiff
+                        return m, nil
+                    }
+                }
+            case modeDescMulti:
+                switch k {
+                case "q", "ctrl+c":
+                    m.overlay = nil
+                    return m, tea.Quit
+                case "b", "esc":
+                    m.mode = modeDesc
+                    return m, nil
+                case "?":
+                    m.showHelp = !m.showHelp
+                    return m, nil
+                case "up", "k":
+                    if m.cursorTool > 0 { m.cursorTool-- }
+                case "down", "j":
+                    if m.cursorTool < len(m.curTools)-1 { m.cursorTool++ }
+                case " ":
+                    if len(m.curTools) > 0 {
+                        t := m.curTools[m.cursorTool]
+                        m.editSelect[t] = !m.editSelect[t]
+                    }
+                case "t": // trim selected (operate on override if present; skip if ≤300)
+                    if m.overlay.Descriptions[m.curServer] == nil { m.overlay.Descriptions[m.curServer] = map[string]string{} }
+                    for _, t := range m.curTools {
+                        if !m.editSelect[t] { continue }
+                        src := m.origDesc[m.curServer][t]
+                        if mm := m.overlay.Descriptions[m.curServer]; mm != nil && mm[t] != "" { src = mm[t] }
+                        if len([]rune(src)) <= 300 { continue }
+                        m.overlay.Descriptions[m.curServer][t] = trim300(src)
+                    }
+                    m.mode = modeDesc
+                    return m, nil
+                case "r": // truncate selected (operate on override if present; skip if ≤300)
+                    if m.overlay.Descriptions[m.curServer] == nil { m.overlay.Descriptions[m.curServer] = map[string]string{} }
+                    for _, t := range m.curTools {
+                        if !m.editSelect[t] { continue }
+                        src := m.origDesc[m.curServer][t]
+                        if mm := m.overlay.Descriptions[m.curServer]; mm != nil && mm[t] != "" { src = mm[t] }
+                        if len([]rune(src)) <= 300 { continue }
+                        m.overlay.Descriptions[m.curServer][t] = truncate300(src)
+                    }
+                    m.mode = modeDesc
+                    return m, nil
+                case "-": // clear selected
+                    if m.overlay.Descriptions[m.curServer] != nil {
+                        for _, t := range m.curTools {
+                            if m.editSelect[t] { delete(m.overlay.Descriptions[m.curServer], t) }
+                        }
+                        if len(m.overlay.Descriptions[m.curServer]) == 0 {
+                            delete(m.overlay.Descriptions, m.curServer)
+                        }
+                    }
+                    m.mode = modeDesc
+                    return m, nil
+                }
             case modeDescEdit:
                 switch k {
                 case "q", "ctrl+c":
@@ -423,14 +524,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
             }
             case modeDiff:
                 switch k {
-                case "b", "esc", "enter", "q", "ctrl+c":
+                case "b", "esc", "enter", "q", "ctrl+c", "d":
                     // always return to desc view
                     m.mode = modeDesc
                     return m, nil
                 case "?":
                     m.showHelp = !m.showHelp
                     return m, nil
-            }
+                case "w":
+                    m.wrapLines = !m.wrapLines
+                    return m, nil
+                case "u":
+                    m.diffUnified = true
+                    return m, nil
+                case "s":
+                    m.diffUnified = false
+                    return m, nil
+                }
             case modeLaunch:
                 switch k {
                 case "q", "ctrl+c":
@@ -442,13 +552,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                 case "?":
                     m.showHelp = !m.showHelp
                     return m, nil
-                case "up", "k", "1":
-                    m.launch = "mcpo"
+                case "up", "k":
+                    if m.launchSel > 0 { m.launchSel-- }
                     return m, nil
-                case "down", "j", "2":
-                    m.launch = "raw"
+                case "down", "j":
+                    if m.launchSel < 2 { m.launchSel++ }
                     return m, nil
                 case "enter":
+                    if m.overlay != nil {
+                        switch m.launchSel {
+                        case 0: m.overlay.LastLaunch = "none"
+                        case 1: m.overlay.LastLaunch = "quick"
+                        case 2: m.overlay.LastLaunch = "named"
+                        }
+                    }
                     return m, tea.Quit
                 }
 		}
@@ -498,6 +615,8 @@ func (m model) View() string {
         return m.viewDiff()
     case modeDescEdit:
         return m.viewDescEdit()
+    case modeDescMulti:
+        return m.viewDescMulti()
     case modeLaunch:
         return m.viewLaunch()
     default:
@@ -510,7 +629,9 @@ func (m model) viewList() string {
     if m.overlay == nil {
         return ""
     }
-    b.WriteString(titleStyle.Render("MCP servers (per config)") + "\n")
+    hdr := "MCP servers (per config)"
+    if m.controller == "raw" { hdr += "  [Controller: RAW]" } else { hdr += "  [Controller: MCPO]" }
+    b.WriteString(titleStyle.Render(hdr) + "\n")
     if len(m.names) == 0 {
         b.WriteString("No servers found.\n")
     } else {
@@ -531,7 +652,7 @@ func (m model) viewList() string {
             b.WriteString(line + "\n")
         }
     }
-    b.WriteString("\nEnter/d: details   c: continue   q: quit\n")
+    b.WriteString("\nEnter/d: details   c: tunnel   g: toggle controller   q: quit\n")
     return b.String()
 }
 
@@ -557,28 +678,34 @@ func (m model) viewMenu() string {
             // no extra tag for OK
         }
     }
-    b.WriteString("1) Edit allowed tools   (a)\n")
-    b.WriteString("2) Edit disallowed tools (d)\n")
-    b.WriteString("3) Edit tool descriptions (+ trim ≤300, - clear, d diff)\n")
-	toggle := "Disable"
-	if m.overlay.Disabled[m.curServer] {
-		toggle = "Enable (currently disabled)"
-	}
-	b.WriteString("4) " + toggle + " server\n\n")
-	b.WriteString("b: back   c: choose launch   q: quit\n")
-	return b.String()
+    items := []string{
+        "Edit allowed tools",
+        "Edit disallowed tools",
+        "Edit tool descriptions",
+    }
+    toggle := "Disable server"
+    if m.overlay.Disabled[m.curServer] { toggle = "Enable server (currently disabled)" }
+    items = append(items, toggle)
+    for i, it := range items {
+        line := fmt.Sprintf("  %s", it)
+        if i == m.menuCursor { line = selStyle.Render("> "+it) }
+        b.WriteString(line+"\n")
+    }
+    b.WriteString("\n↑/↓ select   enter choose   1-4 shortcuts   b back   c tunnel   q quit\n")
+    return b.String()
 }
 
 func (m model) viewHelp() string {
     var b strings.Builder
     b.WriteString(titleStyle.Render("Help — Key Bindings") + "\n\n")
     b.WriteString("Global: q/ctrl+c quit   b/esc back   ? toggle help\n\n")
-    b.WriteString("List: ↑/k, ↓/j, enter/d details, c choose launch\n")
-    b.WriteString("Menu: 1 allow, 2 deny, 3 descriptions, 4 disable\n")
+    b.WriteString("List: ↑/k, ↓/j, enter/d details, c tunnel, g toggle controller\n")
+    b.WriteString("Menu: ↑/↓ select, enter choose (1..4 shortcuts)\n")
     b.WriteString("Allow/Deny: ↑/k, ↓/j, space toggle, enter save\n")
-    b.WriteString("Desc: + trim ≤300, - clear, d diff, e edit\n")
-    b.WriteString("Diff: enter/b back\n")
-    b.WriteString("Launch: ↑/k mcpo, ↓/j raw, enter confirm\n")
+    b.WriteString("Desc: e edit, + trim, - clear, d diff, m multi-select\n")
+    b.WriteString("Multi: space toggle, t trim, r truncate, - clear, b back\n")
+    b.WriteString("Diff: u unified, s side-by-side, w wrap, enter/b back\n")
+    b.WriteString("Launch: ↑/↓ Select tunnel (Local/Quick/Named), enter confirm\n")
     b.WriteString("\n?: close help\n")
     return b.String()
 }
@@ -647,17 +774,23 @@ func (m model) viewDesc() string {
 		if mm := m.overlay.Descriptions[m.curServer]; mm != nil {
 			oxr = mm[t]
 		}
-		if oxr != "" {
-			// custom override
-			if len([]rune(oxr)) <= 300 {
-				badges = append(badges, tagStyle.Render("OVR ≤300"))
-			} else {
-				badges = append(badges, tagStyle.Render("OVR"))
-			}
-		} else if len([]rune(raw)) > 300 {
-			// raw too long (can trim)
-			badges = append(badges, tagWarnStyle.Render(fmt.Sprintf("RAW %d>300", len(raw))))
-		}
+        if oxr != "" {
+            // custom override; show TRIM/TRUNC if it exactly matches those transforms
+            trimmed := trim300(raw)
+            truncated := truncate300(raw)
+            if oxr == trimmed {
+                badges = append(badges, tagStyle.Render("OVR TRIM ≤300"))
+            } else if oxr == truncated {
+                badges = append(badges, tagStyle.Render("OVR TRUNC ≤300"))
+            } else if len([]rune(oxr)) <= 300 {
+                badges = append(badges, tagStyle.Render("OVR ≤300"))
+            } else {
+                badges = append(badges, tagStyle.Render("OVR"))
+            }
+        } else if len([]rune(raw)) > 300 {
+            // raw too long (can trim)
+            badges = append(badges, tagWarnStyle.Render(fmt.Sprintf("RAW %d>300", len(raw))))
+        }
 		line := "  " + t
 		if len(badges) > 0 {
 			line += "  " + strings.Join(badges, " ")
@@ -667,7 +800,22 @@ func (m model) viewDesc() string {
 		}
 		b.WriteString(line + "\n")
 	}
-    b.WriteString("\n+: trim ≤300   -: clear override   d: view diff   enter/b: back   q: quit\n")
+    b.WriteString("\n+: trim ≤300   -: clear override   d: diff   e: edit ($EDITOR)   m: multi   enter/b: back   q: quit\n")
+    return b.String()
+}
+
+func (m model) viewDescMulti() string {
+    var b strings.Builder
+    if m.overlay == nil { return "" }
+    b.WriteString(titleStyle.Render(fmt.Sprintf("Descriptions — multi-select — %s", m.curServer)) + "\n")
+    for i, t := range m.curTools {
+        check := "[ ]"
+        if m.editSelect[t] { check = "[x]" }
+        line := fmt.Sprintf("  %s %s", check, t)
+        if i == m.cursorTool { line = selStyle.Render("> "+line) }
+        b.WriteString(line+"\n")
+    }
+    b.WriteString("\nspace toggle   t trim selected   r truncate selected   - clear selected   b back   q quit\n")
     return b.String()
 }
 
@@ -695,32 +843,29 @@ func (m model) viewDiff() string {
     if m.overlay == nil {
         return ""
     }
-	title := fmt.Sprintf("Diff — %s", m.curServer)
-	b.WriteString(titleStyle.Render(title) + "\n\n")
-	if m.diffBefore == "" && m.diffAfter == "" {
-		b.WriteString("No changes for this tool.\n")
-		b.WriteString("\nenter/b: back\n")
-		return b.String()
-	}
-    b.WriteString(tagStyle.Render("RAW") + "\n")
-    if m.diffBefore == "" {
-        b.WriteString(faintStyle.Render("<empty>") + "\n\n")
-    } else {
-        for _, ln := range strings.Split(m.diffBefore, "\n") {
-            b.WriteString(tagWarnStyle.Render("- ") + ln + "\n")
-        }
-        b.WriteString("\n")
+    title := fmt.Sprintf("Diff — %s", m.curServer)
+    b.WriteString(titleStyle.Render(title) + "\n\n")
+    if strings.TrimSpace(m.diffAfter) == "" {
+        b.WriteString("No override set. (Nothing to diff)\n\n")
+        b.WriteString("enter/b back\n")
+        return b.String()
     }
-    b.WriteString(tagStyle.Render("OVERRIDE") + "\n")
-    if m.diffAfter == "" {
-        b.WriteString(faintStyle.Render("<none set>") + "\n")
-    } else {
-        for _, ln := range strings.Split(m.diffAfter, "\n") {
-            b.WriteString(tagStyle.Render("+ ") + ln + "\n")
-        }
+    if strings.TrimSpace(m.diffBefore) == strings.TrimSpace(m.diffAfter) {
+        b.WriteString("No changes for this tool.\n\n")
+        b.WriteString("u unified  s side-by-side  w wrap  enter/b back\n")
+        return b.String()
     }
-	b.WriteString("\nenter/b: back\n")
-	return b.String()
+    if m.diffUnified {
+        b.WriteString(renderUnifiedDiff(m.diffBefore, m.diffAfter, m.wrapLines))
+    } else {
+        width := m.termWidth
+        if width <= 0 { width = 100 }
+        col := (width - 6) / 2
+        if col < 30 { col = 30 }
+        b.WriteString(renderSideBySideDiff(m.diffBefore, m.diffAfter, col, m.wrapLines))
+    }
+    b.WriteString("\n[u] unified  [s] side-by-side  [w] wrap  [d] back  enter/b back\n")
+    return b.String()
 }
 
 func (m model) viewLaunch() string {
@@ -728,24 +873,21 @@ func (m model) viewLaunch() string {
     if m.overlay == nil {
         return ""
     }
-	b.WriteString(titleStyle.Render("Choose how to launch servers") + "\n")
-	cur1, cur2 := " ", " "
-	if m.launch == "mcpo" {
-		cur1 = ">"
-	} else {
-		cur2 = ">"
-	}
-	b.WriteString(fmt.Sprintf("%s mcpo (HTTP + OpenAPI, recommended)\n", cur1))
-    b.WriteString(fmt.Sprintf("%s raw (stdio only)\n\n", cur2))
-    b.WriteString("↑/↓ select   enter: confirm   b: back   q: quit\n")
+    b.WriteString(titleStyle.Render("Tunnel Mode") + "\n")
+    items := []string{"Local (no tunnel)", "Cloudflare Quick", "Cloudflare Named"}
+    for i, it := range items {
+        line := "  " + it
+        if i == m.launchSel { line = selStyle.Render("> "+it) }
+        b.WriteString(line+"\n")
+    }
+    b.WriteString("\n↑/↓ select   enter confirm   b back   q quit\n")
     return b.String()
 }
 
 func (m *model) launchMode() string {
-	if m.launch == "" {
-		return "mcpo"
-	}
-	return m.launch
+    // Prefer controller toggle over legacy launch string
+    if m.controller == "raw" { return "raw" }
+    return "mcpo"
 }
 
 /* ===== helpers ===== */
@@ -761,4 +903,33 @@ func trim300(s string) string {
 		if unicode.IsSpace(r[i-1]) { cut = i - 1; break }
 	}
 	return strings.TrimSpace(string(r[:cut])) + "…"
+}
+func truncate300(s string) string {
+    const lim = 300
+    r := []rune(strings.TrimSpace(s))
+    if len(r) <= lim {
+        return string(r)
+    }
+    return string(r[:lim]) + "…"
+}
+
+// tryExternalEditor opens $VISUAL or $EDITOR on a temp file and returns edited content.
+func tryExternalEditor(initial string) (string, bool) {
+    ed := os.Getenv("VISUAL")
+    if strings.TrimSpace(ed) == "" { ed = os.Getenv("EDITOR") }
+    if strings.TrimSpace(ed) == "" { return "", false }
+    tf, err := ioutil.TempFile("", "mcp-launch-edit-*.txt")
+    if err != nil { return "", false }
+    path := tf.Name()
+    _, _ = tf.WriteString(initial)
+    _ = tf.Close()
+    cmd := exec.Command(ed, path)
+    cmd.Stdout = os.Stdout
+    cmd.Stderr = os.Stderr
+    cmd.Stdin = os.Stdin
+    if err := cmd.Run(); err != nil { os.Remove(path); return "", false }
+    data, err := os.ReadFile(path)
+    os.Remove(path)
+    if err != nil { return "", false }
+    return string(data), true
 }
