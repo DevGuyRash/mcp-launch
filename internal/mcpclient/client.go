@@ -99,6 +99,7 @@ func inspectStdio(ctx context.Context, name string, s cfg.MCPServer) (Summary, e
         "id":      1,
         "method":  "initialize",
         "params": map[string]any{
+            // MCP protocol version (match current spec date)
             "protocolVersion": "2025-06-18",
             "capabilities":    map[string]any{},
             "clientInfo": map[string]any{
@@ -136,68 +137,90 @@ func inspectStdio(ctx context.Context, name string, s cfg.MCPServer) (Summary, e
             }
         }
     }
-    // 2) initialized notification
+    // 2) initialized notification (MCP v2025 style)
     _ = send(map[string]any{
         "jsonrpc": "2.0",
-        "method":  "initialized",
+        "method":  "notifications/initialized",
     })
     // 3) tools/list with explicit null cursor and pagination
     var tools []Tool
     nextID := 2
-    var cursorStr string // empty means first page (omit params entirely)
+    var cursorStr string // empty => first page
     for {
-        // Build params: only include cursor when non-empty
-        req := map[string]any{
-            "jsonrpc": "2.0",
-            "id":      nextID,
-            "method":  "tools/list",
-        }
+        // Build candidate param shapes for first page compatibility across servers
+        type paramShape struct{ set bool; val map[string]any }
+        var shapes []paramShape
         if strings.TrimSpace(cursorStr) != "" {
-            req["params"] = map[string]any{"cursor": cursorStr}
-        }
-        _ = send(req)
-
-        // read matching response
-        ctxL, cancelL := context.WithTimeout(ctx, 6*time.Second)
-        var r resp
-        for {
-            line, err := readLine(ctxL, rd)
-            if err != nil {
-                cancelL()
-                _ = cmd.Process.Kill()
-                return Summary{ServerName: name}, fmt.Errorf("tools/list read: %w", err)
+            shapes = []paramShape{{set: true, val: map[string]any{"cursor": cursorStr}}}
+        } else {
+            shapes = []paramShape{
+                {set: true,  val: map[string]any{}},                 // params: {}
+                {set: true,  val: map[string]any{"cursor": ""}},  // cursor as empty string
+                {set: true,  val: map[string]any{"cursor": nil}},  // cursor: null
+                {set: false, val: nil},                              // omit params entirely
             }
-            if json.Unmarshal([]byte(line), &r) == nil && r.ID != nil {
-                switch idv := r.ID.(type) {
-                case float64:
-                    if int(idv) == nextID { goto GOT }
-                case int:
-                    if idv == nextID { goto GOT }
+        }
+        var lastErr error
+        for attempt := 0; attempt < len(shapes); attempt++ {
+            req := map[string]any{
+                "jsonrpc": "2.0",
+                "id":      nextID,
+                "method":  "tools/list",
+            }
+            if shapes[attempt].set {
+                req["params"] = shapes[attempt].val
+            }
+            _ = send(req)
+
+            // read matching response
+            ctxL, cancelL := context.WithTimeout(ctx, 6*time.Second)
+            var r resp
+            for {
+                line, err := readLine(ctxL, rd)
+                if err != nil {
+                    cancelL()
+                    _ = cmd.Process.Kill()
+                    return Summary{ServerName: name}, fmt.Errorf("tools/list read: %w", err)
+                }
+                if json.Unmarshal([]byte(line), &r) == nil && r.ID != nil {
+                    switch idv := r.ID.(type) {
+                    case float64:
+                        if int(idv) == nextID { goto GOT }
+                    case int:
+                        if idv == nextID { goto GOT }
+                    }
                 }
             }
-        }
-GOT:
-        cancelL()
-        if r.Error != nil {
-            _ = cmd.Process.Kill()
-            return Summary{ServerName: name}, fmt.Errorf("tools/list failed: %s", r.Error.Message)
-        }
-        var wrapper struct {
-            Tools      []Tool `json:"tools"`
-            NextCursor string  `json:"nextCursor"`
-        }
-        if err := json.Unmarshal(r.Result, &wrapper); err == nil {
-            if len(wrapper.Tools) > 0 {
-                tools = append(tools, wrapper.Tools...)
+        GOT:
+            cancelL()
+            if r.Error != nil {
+                lastErr = fmt.Errorf("tools/list failed: %s", r.Error.Message)
+                // try next shape if available (first page only)
+                if strings.TrimSpace(cursorStr) == "" && attempt+1 < len(shapes) {
+                    continue
+                }
+                _ = cmd.Process.Kill()
+                return Summary{ServerName: name}, lastErr
             }
+            // Success → process result and break attempts loop
+            var wrapper struct {
+                Tools      []Tool `json:"tools"`
+                NextCursor string  `json:"nextCursor"`
+            }
+            if err := json.Unmarshal(r.Result, &wrapper); err == nil {
+                if len(wrapper.Tools) > 0 {
+                    tools = append(tools, wrapper.Tools...)
+                }
+            }
+            if strings.TrimSpace(wrapper.NextCursor) == "" { // no more pages
+                _ = cmd.Process.Kill()
+                return Summary{ServerName: name, Tools: tools}, nil
+            }
+            cursorStr = wrapper.NextCursor
+            break // proceed to next page
         }
-        if strings.TrimSpace(wrapper.NextCursor) == "" { break }
-        cursorStr = wrapper.NextCursor
         nextID++
     }
-    // be nice and terminate
-    _ = cmd.Process.Kill()
-    return Summary{ServerName: name, Tools: tools}, nil
 }
 
 func readLine(ctx context.Context, rd *bufio.Reader) (string, error) {
