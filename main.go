@@ -520,6 +520,9 @@ func cmdUp() {
     if *useTUI {
         logCh := make(chan string, 2048)
         updCh := make(chan appTUI.ResultUpdate, 128)
+        // Allow early quit from Results TUI to cancel background launches immediately
+        stopCh := make(chan struct{})
+        var wg sync.WaitGroup
         // initial items (skeleton)
         items := make([]appTUI.ResultInstance, 0, len(instances))
         for i := range instances {
@@ -537,9 +540,18 @@ func cmdUp() {
             })
         }
         // Launch workers in background
+        wg.Add(1)
         go func() {
+            defer wg.Done()
+            defer close(updCh)
             // Start stacks as before, but stream logs and send updates as info becomes available
             for i := range instances {
+                // Respect early quit: stop launching new instances if TUI exited
+                select {
+                case <-stopCh:
+                    return
+                default:
+                }
                 inst := &instances[i]
 
                 // Start mcpo
@@ -630,6 +642,9 @@ func cmdUp() {
 
         // Block on live results; cleanup happens after exit below
         _ = appTUI.ShowResultsLive(items, logCh, updCh)
+        // Signal early quit to background launcher and wait it out
+        close(stopCh)
+        wg.Wait()
         // Cleanup after user exits TUI
         for _, r := range runs {
             ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
