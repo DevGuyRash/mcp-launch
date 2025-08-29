@@ -457,7 +457,18 @@ go mod tidy && go build -o mcp-launch
 
 - If `--config` is omitted: a Config Collector appears so you can add paths in‑TUI (supports `~` and `$ENV`, Tab for suggestions), set verbosity, tunnel type, and base ports.
 
+### Launch with pre-made configs
+
+```bash
+go mod tidy && go build -o mcp-launch && ./mcp-launch up \
+  --tui \
+  --config "mcp_configs/mcp.chatgpt.spec-workflow.json" \
+  --config "mcp_configs/mcp.chatgpt.utils.json" \
+  --config "mcp_configs/mcp.serena.json"
+```
+
 ### Preflight Screens & Keys
+
 
 - List
   - `↑/↓` select server; `Enter`/`d` details; `c` tunnel picker; `g` toggle Controller (MCPO/RAW); `?` help.
