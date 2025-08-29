@@ -637,7 +637,6 @@ func cmdUp() {
 
                 runs = append(runs, &running{inst: inst, proxy: proxy, mcpo: mcpoCmd})
             }
-            close(updCh)
         }()
 
         // Block on live results; cleanup happens after exit below
