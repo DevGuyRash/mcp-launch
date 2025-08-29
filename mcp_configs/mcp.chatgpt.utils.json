@@ -1,0 +1,34 @@
+{
+  "mcpServers": {
+      "fetch": {
+          "command": "uvx",
+          "args": [
+              "mcp-server-fetch@latest",
+              "--ignore-robots-txt"
+          ]
+      },
+      "filesystem": {
+        "command": "npx",
+        "args": [
+          "-y",
+          "@modelcontextprotocol/server-filesystem",
+          "."
+        ]
+      },
+      "repomix": {
+          "command": "npx",
+          "args": [
+              "-y",
+              "repomix@latest",
+              "--mcp"
+          ]
+      },
+      "time": {
+        "command": "uvx",
+        "args": [
+          "mcp-server-time",
+          "--local-timezone=America/Phoenix"
+        ]
+      }
+  }
+}

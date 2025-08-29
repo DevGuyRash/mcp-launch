@@ -1,0 +1,25 @@
+{
+    "mcpServers": {
+        "serena": {
+            "command": "uvx",
+            "args": [
+                "--from",
+                "git+https://github.com/oraios/serena",
+                "serena",
+                "start-mcp-server",
+                "--project",
+                ".",
+                "--transport",
+                "stdio",
+                "--context",
+                "chatgpt",
+                "--mode",
+                "planning",
+                "--mode",
+                "one-shot"
+            ],
+            "description": "Semantic codebase analysis for spec-driven integration"
+        }
+    }
+  }
+  
