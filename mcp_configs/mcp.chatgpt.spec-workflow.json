@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+      "spec-workflow": {
+        "command": "npx",
+        "args": [
+          "-y",
+          "@pimzino/spec-workflow-mcp@latest",
+          ".",
+          "--AutoStartDashboard"
+        ],
+        "description": "Spec-driven development MCP server that creates and governs Requirements → Design → Tasks with a REQUIRED web dashboard for approvals and progress."
+    }
+  }
+}
