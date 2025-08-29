@@ -36,6 +36,18 @@ The primary way to interact with `mcp-launch` is through its interactive TUI. Af
 - `--config path ...`: (Optional) Specifies paths to `mcp.config.json` files. If omitted, the TUI will guide you through collecting configurations.
 - `-v` or `-vv`: (Optional) Increases verbosity for logging (verbose info or debug logs).
 
+#### 2.2.1. Launch with pre-made configs
+
+To launch with a pre-defined set of configurations, you can use the following command:
+
+```bash
+go mod tidy && go build -o mcp-launch && ./mcp-launch up \
+  --tui \
+  --config "mcp_configs/mcp.chatgpt.spec-workflow.json" \
+  --config "mcp_configs/mcp.chatgpt.utils.json" \
+  --config "mcp_configs/mcp.serena.json"
+```
+
 ### 2.3. Configuration
 
 The core configuration for the MCP servers managed by `mcp-launch` is defined in `mcp.config.json`. This file specifies how various MCP servers (e.g., `serena`, `mcp-server-time`, `@modelcontextprotocol/server-filesystem`) are invoked and their arguments. Understanding this file is key to comprehending the tools and services the `mcp-launch` application orchestrates.
