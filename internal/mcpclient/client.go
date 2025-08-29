@@ -1,16 +1,17 @@
 package mcpclient
 
 import (
-	"bufio"
-	"context"
-	"encoding/json"
-	"errors"
-	"fmt"
-	"io"
-	"os"
-	"os/exec"
-	"strings"
-	"time"
+    "bufio"
+    "context"
+    "encoding/json"
+    "errors"
+    "fmt"
+    "io"
+    "os"
+    "os/exec"
+    "sync"
+    "strings"
+    "time"
 
 	cfg "mcp-launch/internal/config"
 )
@@ -42,6 +43,7 @@ func InspectServer(ctx context.Context, name string, s cfg.MCPServer) (Summary, 
 
 func inspectStdio(ctx context.Context, name string, s cfg.MCPServer) (Summary, error) {
     debug := os.Getenv("MCP_LAUNCH_DEBUG_MCPCLIENT") == "1"
+    forceLine := strings.ToLower(os.Getenv("MCP_LAUNCH_FORCE_FRAMING")) == "line"
     if s.Command == "" {
         return Summary{ServerName: name}, fmt.Errorf("server %s missing command", name)
     }
@@ -110,7 +112,6 @@ func inspectStdio(ctx context.Context, name string, s cfg.MCPServer) (Summary, e
     // Single reader goroutines pumping full JSON messages into a shared channel.
     messages := make(chan string, 256)
     pump := func(tag string, r *bufio.Reader) {
-        defer close(messages)
         for {
             line, err := r.ReadString('\n')
             if err != nil {
@@ -153,17 +154,14 @@ func inspectStdio(ctx context.Context, name string, s cfg.MCPServer) (Summary, e
             if debug { fmt.Println("[mcpclient] (noise)", tag, lt) }
         }
     }
-    go pump("stdout", rd)
-    go pump("stderr", rdErr)
+    var pumpWg sync.WaitGroup
+    pumpWg.Add(2)
+    go func(){ pump("stdout", rd); pumpWg.Done() }()
+    go func(){ pump("stderr", rdErr); pumpWg.Done() }()
+    go func(){ pumpWg.Wait(); close(messages) }()
 
-    // 1) initialize (auto-detect framing): send both with distinct ids; accept whichever returns first.
-    // Initialize param shape variants for broad compatibility
+    // 1) initialize (prefer LSP framing). Parameter shapes for broad compatibility
     initParams := []map[string]any{
-        {
-            "protocolVersion": "2025-06-18",
-            "capabilities":    map[string]any{},
-            "clientInfo": map[string]any{"name": "mcp-launch", "version": "0.0.0"},
-        },
         {
             "protocolVersion": "2024-11-05",
             "capabilities":    map[string]any{},
@@ -174,6 +172,11 @@ func inspectStdio(ctx context.Context, name string, s cfg.MCPServer) (Summary, e
             "capabilities": map[string]any{},
             "clientInfo":   map[string]any{"name": "mcp-launch", "version": "0.0.0"},
         },
+        {
+            "protocolVersion": "2025-06-18",
+            "capabilities":    map[string]any{},
+            "clientInfo": map[string]any{"name": "mcp-launch", "version": "0.0.0"},
+        },
     }
     makeInit := func(params map[string]any) map[string]any {
         return map[string]any{
@@ -182,15 +185,14 @@ func inspectStdio(ctx context.Context, name string, s cfg.MCPServer) (Summary, e
             "params":  params,
         }
     }
-    // id=1 for LSP, id=2 for line
+    // id=1 for initialize request
     req1 := makeInit(initParams[0])
     req1["id"] = 1
-    req2 := makeInit(initParams[0])
-    req2["id"] = 2
-    framing := "auto"
+    framing := "lsp"
+    if forceLine { framing = "line" }
 
     // Robust handshake: wrappers like npx/uvx may consume early stdin before exec.
-    // Re-send initialize periodically until we see a proper response or timeout.
+    // Try a few shapes sequentially (LSP only) until we see a proper response or timeout.
     initDeadline := 60 * time.Second
     // Heuristic: when using package runners that may install on first run, allow more time
     if strings.Contains(strings.ToLower(s.Command), "npx") ||
@@ -200,30 +202,28 @@ func inspectStdio(ctx context.Context, name string, s cfg.MCPServer) (Summary, e
         initDeadline = 120 * time.Second
     }
     start := time.Now()
-    // Attempt initialize with alternating framings and param shapes until success or timeout
-    attempt := 0
+    shapeIdx := 0
+    attemptsPerShape := 3
+    attempts := 0
     for {
-        // select framing and params for this attempt (prefer LSP, retry, then line)
-        shape := initParams[(attempt/2)%len(initParams)]
-        // IDs remain constant; choose which one to send this time
-        if attempt%4 < 3 {
-            req1 = makeInit(shape); req1["id"] = 1
+        // Build and send initialize (LSP only)
+        req1 = makeInit(initParams[shapeIdx])
+        req1["id"] = 1
+        if framing == "line" {
+            if debug { fmt.Println("[mcpclient] >> initialize (line)") }
+            _ = sendLine(req1)
+        } else {
             if debug { fmt.Println("[mcpclient] >> initialize (LSP)") }
             _ = sendLSP(req1)
-        } else {
-            req2 = makeInit(shape); req2["id"] = 2
-            if debug { fmt.Println("[mcpclient] >> initialize (line)") }
-            _ = sendLine(req2)
         }
 
-        // small read window for each attempt
-        readCtx, cancel := context.WithTimeout(ctx, 2500*time.Millisecond)
+        // wait for a response for this attempt
+        readCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
         var got bool
         for !got {
             var line string
             select {
             case <-readCtx.Done():
-                // timeout for this attempt
                 break
             case line, _ = <-messages:
                 if line == "" { // channel closed
@@ -237,12 +237,7 @@ func inspectStdio(ctx context.Context, name string, s cfg.MCPServer) (Summary, e
             if json.Unmarshal([]byte(line), &r) == nil && r.ID != nil {
                 switch idv := r.ID.(type) {
                 case float64:
-                    if int(idv) == 1 || int(idv) == 2 {
-                        if int(idv) == 1 {
-                            framing = "lsp"
-                        } else {
-                            framing = "line"
-                        }
+                    if int(idv) == 1 {
                         if r.Error != nil {
                             cancel()
                             _ = cmd.Process.Kill()
@@ -251,8 +246,7 @@ func inspectStdio(ctx context.Context, name string, s cfg.MCPServer) (Summary, e
                         got = true
                     }
                 case int:
-                    if idv == 1 || idv == 2 {
-                        if idv == 1 { framing = "lsp" } else { framing = "line" }
+                    if idv == 1 {
                         got = true
                     }
                 }
@@ -266,17 +260,15 @@ func inspectStdio(ctx context.Context, name string, s cfg.MCPServer) (Summary, e
             _ = cmd.Process.Kill()
             return Summary{ServerName: name}, fmt.Errorf("init read: %w", context.DeadlineExceeded)
         }
-        attempt++
+        attempts++
+        if attempts >= attemptsPerShape {
+            attempts = 0
+            shapeIdx = (shapeIdx + 1) % len(initParams)
+        }
     }
-	// 2) initialized notifications (send both variants for compatibility)
-	sender := sendLSP
-	if framing == "line" {
-		sender = sendLine
-	}
-	_ = sender(map[string]any{
-		"jsonrpc": "2.0",
-		"method":  "initialized",
-	})
+	// 2) initialized notification (spec-conformant)
+    sender := sendLSP
+    if framing == "line" { sender = sendLine }
 	_ = sender(map[string]any{
 		"jsonrpc": "2.0",
 		"method":  "notifications/initialized",
@@ -321,6 +313,7 @@ func inspectStdio(ctx context.Context, name string, s cfg.MCPServer) (Summary, e
         // read matching response
         ctxL, cancelL := context.WithTimeout(ctx, 12*time.Second)
         var r resp
+    READ_LOOP:
         for {
             var line string
             select {
@@ -338,9 +331,9 @@ func inspectStdio(ctx context.Context, name string, s cfg.MCPServer) (Summary, e
             if json.Unmarshal([]byte(line), &r) == nil && r.ID != nil {
                 switch idv := r.ID.(type) {
                 case float64:
-                    if int(idv) == nextID { break }
+                    if int(idv) == nextID { break READ_LOOP }
                 case int:
-                    if idv == nextID { break }
+                    if idv == nextID { break READ_LOOP }
                 }
             }
         }
