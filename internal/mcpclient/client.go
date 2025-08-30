@@ -15,6 +15,19 @@ import (
     cfg "mcp-launch/internal/config"
 )
 
+// mapsClone returns a shallow copy of the provided map.
+// It is used to duplicate JSON-RPC request envelopes before tweaking fields like "id".
+func mapsClone(in map[string]any) map[string]any {
+    if in == nil {
+        return nil
+    }
+    out := make(map[string]any, len(in))
+    for k, v := range in {
+        out[k] = v
+    }
+    return out
+}
+
 // Tool describes a single MCP tool discovered via tools/list.
 type Tool struct {
     Name        string `json:"name"`
@@ -73,8 +86,8 @@ func inspectStdio(ctx context.Context, name string, s cfg.MCPServer) (Summary, e
     // Drain stderr in background to avoid blocking if server logs a lot.
     go io.Copy(io.Discard, stderr) //nolint:errcheck
 
-    // Helper to send a JSON-RPC message (newline-delimited)
-    send := func(v any) error {
+    // Helpers to send JSON-RPC messages (newline-delimited JSON only)
+    sendLine := func(v any) error {
         b, _ := json.Marshal(v)
         b = append(b, '\n')
         _, err := stdin.Write(b)
@@ -93,13 +106,58 @@ func inspectStdio(ctx context.Context, name string, s cfg.MCPServer) (Summary, e
     }
     rd := bufio.NewReader(stdout)
 
-    // 1) initialize
-    _ = send(map[string]any{
+    // readJSON reads a full JSON message, supporting both newline JSON and LSP Content-Length frames
+    var readJSON func(ctx context.Context, rd *bufio.Reader) (string, error)
+    readJSON = func(ctx context.Context, rd *bufio.Reader) (string, error) {
+        line, err := readLine(ctx, rd)
+        if err != nil {
+            return "", err
+        }
+        lt := strings.TrimSpace(line)
+        if lt == "" {
+            return readJSON(ctx, rd)
+        }
+        low := strings.ToLower(lt)
+        if strings.HasPrefix(low, "content-length:") {
+            parts := strings.SplitN(lt, ":", 2)
+            if len(parts) != 2 { return readJSON(ctx, rd) }
+            nstr := strings.TrimSpace(parts[1])
+            // read header lines until blank line
+            for {
+                nxt, errB := readLine(ctx, rd)
+                if errB != nil { return "", errB }
+                if strings.TrimSpace(nxt) == "" { break }
+            }
+            var n int
+            fmt.Sscanf(nstr, "%d", &n)
+            if n <= 0 { return readJSON(ctx, rd) }
+            type res struct{ b []byte; e error }
+            ch := make(chan res, 1)
+            go func(){
+                buf := make([]byte, n)
+                _, e := io.ReadFull(rd, buf)
+                ch <- res{buf, e}
+            }()
+            select {
+            case <-ctx.Done():
+                return "", ctx.Err()
+            case out := <-ch:
+                if out.e != nil { return "", out.e }
+                return strings.TrimSpace(string(out.b)), nil
+            }
+        }
+        if strings.HasPrefix(lt, "{") || strings.HasPrefix(lt, "[") {
+            return lt, nil
+        }
+        // unknown noise, keep reading
+        return readJSON(ctx, rd)
+    }
+
+    // 1) initialize: newline-delimited JSON only; single request id=1
+    initReq := map[string]any{
         "jsonrpc": "2.0",
-        "id":      1,
         "method":  "initialize",
         "params": map[string]any{
-            // MCP protocol version (match current spec date)
             "protocolVersion": "2025-06-18",
             "capabilities":    map[string]any{},
             "clientInfo": map[string]any{
@@ -107,14 +165,16 @@ func inspectStdio(ctx context.Context, name string, s cfg.MCPServer) (Summary, e
                 "version": "0.0.0",
             },
         },
-    })
+    }
+    initReq["id"] = 1
+    _ = sendLine(initReq)
 
-    // wait for id=1
+    // wait for id=1 only (known-good behavior, 6s timeout)
     ctxR, cancel := context.WithTimeout(ctx, 6*time.Second)
     defer cancel()
     var sawInit bool
     for !sawInit {
-        line, err := readLine(ctxR, rd)
+        line, err := readJSON(ctxR, rd)
         if err != nil {
             _ = cmd.Process.Kill()
             return Summary{ServerName: name}, fmt.Errorf("init read: %w", err)
@@ -138,13 +198,14 @@ func inspectStdio(ctx context.Context, name string, s cfg.MCPServer) (Summary, e
         }
     }
     // 2) initialized notification (MCP v2025 style)
-    _ = send(map[string]any{
+    notify := map[string]any{
         "jsonrpc": "2.0",
         "method":  "notifications/initialized",
-    })
+    }
+    _ = sendLine(notify)
     // 3) tools/list with explicit null cursor and pagination
     var tools []Tool
-    nextID := 2
+    nextID := 3
     var cursorStr string // empty => first page
     for {
         // Build candidate param shapes for first page compatibility across servers
@@ -170,13 +231,13 @@ func inspectStdio(ctx context.Context, name string, s cfg.MCPServer) (Summary, e
             if shapes[attempt].set {
                 req["params"] = shapes[attempt].val
             }
-            _ = send(req)
+            _ = sendLine(req)
 
             // read matching response
-            ctxL, cancelL := context.WithTimeout(ctx, 6*time.Second)
+            ctxL, cancelL := context.WithTimeout(ctx, 8*time.Second)
             var r resp
             for {
-                line, err := readLine(ctxL, rd)
+                line, err := readJSON(ctxL, rd)
                 if err != nil {
                     cancelL()
                     _ = cmd.Process.Kill()
@@ -251,4 +312,3 @@ func inspectHTTP(ctx context.Context, name string, s cfg.MCPServer) (Summary, er
     }
     return Summary{ServerName: name}, errors.New("streamable-http inspection not implemented for server without a stdio command fallback")
 }
-
