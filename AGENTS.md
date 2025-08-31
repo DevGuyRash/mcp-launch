@@ -80,6 +80,7 @@ This section documents a regression that caused all MCP servers to fail during p
   - Send only `notifications/initialized`.
   - `tools/list` pagination uses first-page parameter fallbacks: `params:{}`, `cursor:""`, `cursor:null`, and omitting `params`.
   - Correct response matching using a labeled break (or `goto` label pattern) to exit the loop when the expected `id` is seen.
+  - Startup time variance mitigation: Fast–slow init strategy. First wait window 6s, and on timeout only, a single fallback window controlled by the `MCP_INIT_TIMEOUT_SEC` environment variable (default 20s). This accommodates cold `npx` installs and servers that start auxiliary dashboards before responding.
 
 - How not to break it again (Guardrails):
   - Do not mix framing modes on stdio. Stick to newline-delimited JSON unless the project explicitly introduces a feature-flagged LSP pathway with full test coverage.
@@ -87,24 +88,19 @@ This section documents a regression that caused all MCP servers to fail during p
   - Preserve the `tools/list` first-page param-shape fallbacks to maximize server compatibility.
   - Avoid per-read goroutines or shared-channel closes from multiple goroutines; prefer the simple, blocking `ReadString` with a timeout wrapper as used in the known-good flow.
   - When modifying response loops, ensure the loop exits on the matched `id` (labeled break or equivalent). Add focused tests/logs when touching this area.
+  - Use the fast–slow init strategy and `MCP_INIT_TIMEOUT_SEC` override rather than increasing global timeouts blindly. Never switch framing modes as a fallback within the same connection.
 
-## 5. Troubleshooting: repomix (MCP)
+## 5. Startup and Timeout Policy (MCP)
 
-If preflight shows `repomix: init read: EOF`, this indicates the process exited before responding to `initialize`. Common causes:
+This project must work with many different MCP servers without server-specific customization. Startup time varies by environment (e.g., cold `npx` caches, parallel launches, servers that also spin up dashboards). To stay robust and generic:
 
-- Incorrect CLI invocation: Ensure the config uses `npx -y repomix@latest --mcp` so the CLI runs in MCP mode and binds stdio.
-- Network/tooling prerequisites: `npx` may need network access the first time. Verify your environment permits this and that Node is available.
-- Server writes to stderr only or prints logs that aren’t JSON-RPC: The current client expects newline-delimited JSON on stdout. If repomix changes behavior, revisit invocation or add a targeted compatibility switch per upstream docs.
-
-To test repomix standalone:
-
-```
-# Inspect repomix CLI options
-npx -y repomix@latest --help
-
-# Quick handshake test (newline JSON):
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}' \
-| npx -y repomix@latest --mcp
-```
-
-Update the `mcp_configs/mcp.chatgpt.utils.json` entry for `repomix` only if upstream docs differ from the above (e.g., a different package name or subcommand).
+- Framing: Use newline-delimited JSON only on stdio. Do not send LSP Content-Length frames unless a dedicated, feature-flagged pathway is introduced with tests. Never mix framings on the same connection.
+- Initialize: Send a single `initialize` with `id:1` and `protocolVersion: "2025-06-18"`. Accept servers that respond with earlier versions (e.g., `2024-11-05`). After success, send only `notifications/initialized`.
+- Init wait strategy: Fast–slow approach.
+  - Fast window: wait up to 6 seconds for the `id:1` response.
+  - Slow fallback: on timeout only, wait once more for `MCP_INIT_TIMEOUT_SEC` seconds (default 20). Operators can override via environment: `export MCP_INIT_TIMEOUT_SEC=30`.
+- Pagination: For `tools/list`, preserve first-page param-shape fallbacks for compatibility: `params:{}`, `cursor:""`, `cursor:null`, and omitting `params`.
+- Response matching: Match on the exact request `id` and use a labeled break (or equivalent) to exit the read loop when matched.
+- Noise tolerance: Some servers print human-readable logs to stdout (e.g., ephemeral dashboard URLs) before responding. The client must ignore non-JSON lines and continue waiting within the timeout windows.
+- Parallel instances: Multiple instances may be launched concurrently by other tools (e.g., editors). Since stdio transport is per-process, this is fine. If a server spawns a dashboard, it should use an ephemeral port and not collide with other instances.
+- External CLI caveats (npx): If `npx` fails with cache rename errors (e.g., `ENOTEMPTY` under `~/.npm/_npx`), this is an external tooling issue. Remedies include clearing caches, isolating the cache per run (e.g., `npx --cache /tmp/npx-$$ ...`), or using a global install. These are not client-regression indicators.
