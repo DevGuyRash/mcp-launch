@@ -16,6 +16,12 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	mcpclient "mcp-launch/internal/mcpclient"
+    // New TUI state and widgets
+    tuiState "mcp-launch/internal/tui/state"
+    chips "mcp-launch/internal/tui/widgets/tagchips"
+    helpov "mcp-launch/internal/tui/widgets/helpoverlay"
+    statusbar "mcp-launch/internal/tui/widgets/statusbar"
+    util "mcp-launch/internal/tui/util"
 )
 
 // ServerStatus indicates inspection outcome for a server.
@@ -199,20 +205,27 @@ func (m model) Init() tea.Cmd { return nil }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
-	case tea.WindowSizeMsg:
-		if msg.Width > 0 {
-			m.termWidth = msg.Width
-			w := msg.Width - 4
-			if w < 20 {
-				w = 20
-			}
-			if m.editWrap {
-				m.ta.SetWidth(w)
-			} else {
-				m.ta.SetWidth(10000)
-			}
-		}
-		return m, nil
+case tea.WindowSizeMsg:
+    if msg.Width > 0 {
+        m.termWidth = msg.Width
+        w := msg.Width - 4
+        if w < 20 {
+            w = 20
+        }
+        if m.editWrap {
+            m.ta.SetWidth(w)
+        } else {
+            m.ta.SetWidth(10000)
+        }
+        // Deterministic narrow fallback for side-by-side diffs
+        minCol := 30
+        threshold := 2*minCol + 6 // two columns + separator/gutters
+        if !m.diffUnified && m.termWidth < threshold {
+            m.diffUnified = true
+            m.statusMsg = "Narrow width: using unified view"
+        }
+    }
+    return m, nil
 	case tea.KeyMsg:
 		rawKey := msg.String()
 		k := strings.ToLower(rawKey)
@@ -295,21 +308,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.overlay.Disabled[m.curServer] = !m.overlay.Disabled[m.curServer]
 				}
 				return m, nil
-			case "1", "a": // shortcuts
-				m.prepareToolEditor(true)
-				m.mode = modeAllow
-				return m, nil
-			case "2", "d":
-				m.prepareToolEditor(false)
-				m.mode = modeDeny
-				return m, nil
-			case "3":
-				m.prepareToolEditor(true)
-				m.mode = modeDesc
-				return m, nil
-			case "4":
-				m.overlay.Disabled[m.curServer] = !m.overlay.Disabled[m.curServer]
-				return m, nil
+        case "a": // shortcut
+            m.prepareToolEditor(true)
+            m.mode = modeAllow
+            return m, nil
+        case "d":
+            m.prepareToolEditor(false)
+            m.mode = modeDeny
+            return m, nil
+        // Numeric shortcuts removed per UX guidance
 			case "c":
 				m.mode = modeLaunch
 				return m, nil
@@ -794,31 +801,69 @@ func init() {
 }
 
 func (m model) View() string {
-	if m.showHelp {
-		return m.viewHelp()
-	}
-	switch m.mode {
-	case modeList:
-		return m.viewList()
-	case modeMenu:
-		return m.viewMenu()
-	case modeAllow:
-		return m.viewSelect("Allowed tools (space to toggle, enter to save)")
-	case modeDeny:
-		return m.viewSelect("Disallowed tools (space to toggle, enter to save)")
-	case modeDesc:
-		return m.viewDesc()
-	case modeDiff:
-		return m.viewDiff()
-	case modeDescEdit:
-		return m.viewDescEdit()
-	case modeDescMulti:
-		return m.viewDescMulti()
-	case modeLaunch:
-		return m.viewLaunch()
-	default:
-		return ""
-	}
+    var out string
+    switch m.mode {
+    case modeList:
+        out = m.viewList()
+    case modeMenu:
+        out = m.viewMenu()
+    case modeAllow:
+        out = m.viewSelect("Allowed tools (space to toggle, enter to save)")
+    case modeDeny:
+        out = m.viewSelect("Disallowed tools (space to toggle, enter to save)")
+    case modeDesc:
+        out = m.viewDesc()
+    case modeDiff:
+        out = m.viewDiff()
+    case modeDescEdit:
+        out = m.viewDescEdit()
+    case modeDescMulti:
+        out = m.viewDescMulti()
+    case modeLaunch:
+        out = m.viewLaunch()
+    default:
+        out = ""
+    }
+    // Append Help overlay (non-blocking) if toggled
+    if m.showHelp {
+        hov := helpov.NewHelpOverlay()
+        out += "\n" + hov.View(m.uiState()) + "\n"
+    }
+    // Append Status Bar for consistent state visibility
+    sb := statusbar.NewStatusBar()
+    out += "\n" + sb.View(m.uiState()) + "\n"
+    return out
+}
+
+// uiState maps the current model fields into shared UI state for widgets.
+func (m model) uiState() tuiState.UIState {
+    s := tuiState.UIState{}
+    if m.editInsert {
+        s.Mode = tuiState.INSERT
+    } else {
+        s.Mode = tuiState.CMD
+    }
+    // Wrap depends on context
+    if m.mode == modeDescEdit {
+        s.Wrap = m.editWrap
+    } else {
+        s.Wrap = m.wrapLines
+    }
+    if m.diffUnified {
+        s.View = tuiState.Unified
+    } else {
+        s.View = tuiState.SideBySide
+    }
+    s.Width = m.termWidth
+    s.MinCol = 30
+    s.ScrollHLeft = 0
+    s.ScrollHRight = 0
+    s.ScrollV = 0
+    s.SyncScroll = false
+    s.Limit = descLimit()
+    s.Edited = false
+    s.Notice = strings.TrimSpace(m.statusMsg)
+    return s
 }
 
 func (m model) viewList() string {
@@ -853,8 +898,8 @@ func (m model) viewList() string {
 			b.WriteString(line + "\n")
 		}
 	}
-	b.WriteString("\nEnter/d: details   c: tunnel   g: toggle controller   q: quit\n")
-	return b.String()
+    b.WriteString("\nEnter/d: details   c: tunnel   g: toggle controller   q: quit   ?: help\n")
+    return b.String()
 }
 
 func (m model) viewMenu() string {
@@ -896,7 +941,7 @@ func (m model) viewMenu() string {
 		}
 		b.WriteString(line + "\n")
 	}
-	b.WriteString("\n↑/↓ select   enter choose   1-4 shortcuts   b back   c tunnel   q quit\n")
+    b.WriteString("\n↑/↓ select   enter choose   b back   c tunnel   q quit   ?: help\n")
 	return b.String()
 }
 
@@ -967,55 +1012,42 @@ func (m model) viewSelect(title string) string {
 }
 
 func (m model) viewDesc() string {
-	var b strings.Builder
-	if m.overlay == nil {
-		return ""
-	}
-	b.WriteString(titleStyle.Render(fmt.Sprintf("Descriptions — %s", m.curServer)) + "\n")
-	cur := m.curTools
-	for i, t := range cur {
-		raw := m.origDesc[m.curServer][t]
-		lim := descLimit()
-		badges := make([]string, 0, 2)
-		oxr := ""
-		if mm := m.overlay.Descriptions[m.curServer]; mm != nil {
-			oxr = mm[t]
-		}
-		if oxr != "" {
-			// custom override; show TRIM/TRUNC if it exactly matches those transforms
-			trimmed := trim300(raw)
-			truncated := truncate300(raw)
-			if oxr == trimmed && len([]rune(strings.TrimSpace(raw))) > lim {
-				badges = append(badges, tagStyle.Render(fmt.Sprintf("Edited (trim ≤%d)", lim)))
-			} else if oxr == truncated && len([]rune(strings.TrimSpace(raw))) > lim {
-				badges = append(badges, tagStyle.Render(fmt.Sprintf("Edited (truncate ≤%d)", lim)))
-			} else if len([]rune(oxr)) <= lim && strings.TrimSpace(oxr) != strings.TrimSpace(raw) {
-				badges = append(badges, tagStyle.Render(fmt.Sprintf("Edited (≤%d)", lim)))
-			} else {
-				badges = append(badges, tagStyle.Render("Edited"))
-			}
-		} else if len([]rune(strings.TrimSpace(raw))) > lim {
-			// raw too long (can shorten)
-			badges = append(badges, tagWarnStyle.Render(fmt.Sprintf("Too long: %d>%d", len(raw), lim)))
-		}
-		// If edited and still over limit, show explicit tag
-		if strings.TrimSpace(oxr) != "" && len([]rune(strings.TrimSpace(oxr))) > lim {
-			badges = append(badges, tagWarnStyle.Render(fmt.Sprintf("Edited (>%d)", lim)))
-		}
-		// compose counts
-		rawLen := len([]rune(raw))
-		line := "  " + t + "  " + faintStyle.Render(fmt.Sprintf("raw=%d", rawLen))
-		if len(badges) > 0 {
-			line += "  " + strings.Join(badges, " ")
-		}
-		if i == m.cursorTool {
-			line = selStyle.Render("> " + line[2:])
-		}
-		b.WriteString(line + "\n")
-	}
-	b.WriteString("\nKeys: + trim   - clear   d diff   e edit   E $EDITOR   m multi   enter/b back   q quit   y copy\n")
-	b.WriteString(faintStyle.Render("— Edited (trim)=word-safe shorten · Edited (truncate)=hard cut · Too long=over limit") + "\n")
-	return b.String()
+    var b strings.Builder
+    if m.overlay == nil {
+        return ""
+    }
+    b.WriteString(titleStyle.Render(fmt.Sprintf("Descriptions — %s", m.curServer)) + "\n")
+    cur := m.curTools
+    for i, t := range cur {
+        raw := m.origDesc[m.curServer][t]
+        oxr := ""
+        if mm := m.overlay.Descriptions[m.curServer]; mm != nil {
+            oxr = mm[t]
+        }
+        // Compute tags with auto-detection of Trimmed/Truncated; mark EDITED when override
+        // differs from raw and is not an auto-shortening.
+        base := util.ComputeTags(raw, oxr, descLimit(), false)
+        hasTrim, hasTrunc := false, false
+        for _, tg := range base {
+            if tg.Kind == tuiState.TRIMMED { hasTrim = true }
+            if tg.Kind == tuiState.TRUNCATED { hasTrunc = true }
+        }
+        edited := strings.TrimSpace(oxr) != "" && strings.TrimSpace(oxr) != strings.TrimSpace(raw) && !(hasTrim || hasTrunc)
+        tags := make([]tuiState.Tag, 0, len(base)+1)
+        if edited { tags = append(tags, tuiState.Tag{Kind: tuiState.EDITED}) }
+        tags = append(tags, base...)
+        chipsLine := chips.View(tags, util.NoColor(false))
+        line := "  " + t
+        if strings.TrimSpace(chipsLine) != "" {
+            line += "  " + chipsLine
+        }
+        if i == m.cursorTool {
+            line = selStyle.Render("> " + line[2:])
+        }
+        b.WriteString(line + "\n")
+    }
+    b.WriteString("\nKeys: + trim   - clear   d diff   e edit   E $EDITOR   m multi   enter/b back   q quit   y copy   ?: help\n")
+    return b.String()
 }
 
 func (m model) viewDescMulti() string {
@@ -1024,48 +1056,38 @@ func (m model) viewDescMulti() string {
 		return ""
 	}
 	b.WriteString(titleStyle.Render(fmt.Sprintf("Descriptions — multi-select — %s", m.curServer)) + "\n")
-	for i, t := range m.curTools {
-		check := "[ ]"
-		if m.editSelect[t] {
-			check = "[x]"
-		}
-		raw := m.origDesc[m.curServer][t]
-		lim := descLimit()
-		badges := make([]string, 0, 2)
-		oxr := ""
-		if mm := m.overlay.Descriptions[m.curServer]; mm != nil {
-			oxr = mm[t]
-		}
-		if oxr != "" {
-			trimmed := trim300(raw)
-			truncated := truncate300(raw)
-			lim := descLimit()
-			if oxr == trimmed && len([]rune(strings.TrimSpace(raw))) > lim {
-				badges = append(badges, tagStyle.Render(fmt.Sprintf("Edited (trim ≤%d)", lim)))
-			} else if oxr == truncated && len([]rune(strings.TrimSpace(raw))) > lim {
-				badges = append(badges, tagStyle.Render(fmt.Sprintf("Edited (truncate ≤%d)", lim)))
-			} else if len([]rune(oxr)) <= lim && strings.TrimSpace(oxr) != strings.TrimSpace(raw) {
-				badges = append(badges, tagStyle.Render(fmt.Sprintf("Edited (≤%d)", lim)))
-			} else {
-				badges = append(badges, tagStyle.Render("Edited"))
-			}
-		} else if len([]rune(strings.TrimSpace(raw))) > lim {
-			badges = append(badges, tagWarnStyle.Render(fmt.Sprintf("Too long: %d>%d", len(raw), lim)))
-		}
-		line := fmt.Sprintf("  %s %s [raw=%d]", check, t, len([]rune(raw)))
-		if len(badges) > 0 {
-			line += "  " + strings.Join(badges, " ")
-		}
-		if strings.TrimSpace(oxr) != "" {
-			line += fmt.Sprintf(" [ovr=%d]", len([]rune(oxr)))
-		}
-		if i == m.cursorTool {
-			line = selStyle.Render("> " + line)
-		}
-		b.WriteString(line + "\n")
-	}
-	b.WriteString("\nspace toggle   a all   u none   t trim   r truncate   - clear   b back   q quit\n")
-	return b.String()
+    for i, t := range m.curTools {
+        check := "[ ]"
+        if m.editSelect[t] {
+            check = "[x]"
+        }
+        raw := m.origDesc[m.curServer][t]
+        oxr := ""
+        if mm := m.overlay.Descriptions[m.curServer]; mm != nil {
+            oxr = mm[t]
+        }
+        base := util.ComputeTags(raw, oxr, descLimit(), false)
+        hasTrim, hasTrunc := false, false
+        for _, tg := range base {
+            if tg.Kind == tuiState.TRIMMED { hasTrim = true }
+            if tg.Kind == tuiState.TRUNCATED { hasTrunc = true }
+        }
+        edited := strings.TrimSpace(oxr) != "" && strings.TrimSpace(oxr) != strings.TrimSpace(raw) && !(hasTrim || hasTrunc)
+        tags := make([]tuiState.Tag, 0, len(base)+1)
+        if edited { tags = append(tags, tuiState.Tag{Kind: tuiState.EDITED}) }
+        tags = append(tags, base...)
+        chipsLine := chips.View(tags, util.NoColor(false))
+        line := fmt.Sprintf("  %s %s", check, t)
+        if strings.TrimSpace(chipsLine) != "" {
+            line += "  " + chipsLine
+        }
+        if i == m.cursorTool {
+            line = selStyle.Render("> " + line)
+        }
+        b.WriteString(line + "\n")
+    }
+    b.WriteString("\nspace toggle   a all   u none   t trim   r truncate   - clear   b back   q quit   ?: help\n")
+    return b.String()
 }
 
 func (m model) viewDescEdit() string {
