@@ -1,6 +1,21 @@
-Language: Go 1.24 toolchain (go.mod declares go 1.23 with toolchain 1.24.6)
-UI: Bubble Tea + Lipgloss TUI
-HTTP: net/http, ReverseProxy to mcpo
-Specs: OpenAPI merge builder
-Cloud: cloudflared quick/named tunnel support
-Config: Claude-style JSON configs with mcpServers map
+# Tech Stack
+
+- Language: Go (Go 1.24+)
+- UI: Bubble Tea TUI
+- Purpose: Inspect + launch MCP stacks (via mcpo), optional publish over Cloudflare
+- Key module: internal/mcpclient – stdio JSON-RPC client for MCP servers
+- Handshake policy:
+  - Newline-delimited JSON only (no mixed LSP/content-length on stdio)
+  - Single initialize with id:1 and protocolVersion "2025-06-18"; accept servers responding with older protocol versions
+  - Send only notifications/initialized after initialize
+  - tools/list pagination with first-page param fallbacks: params:{}, cursor:"", cursor:null, omit params
+  - Response-match by id with labeled-break exit
+  - Noise tolerant (ignores non-JSON stdout lines)
+- Startup timing:
+  - Fast-slow init strategy: 6s fast window; on timeout only, fallback wait controlled by env MCP_INIT_TIMEOUT_SEC (default 20s)
+- External tooling:
+  - Node + npx for some MCP servers (e.g., spec-workflow, repomix)
+  - uvx for Python-based servers
+- Known environment tips:
+  - Run TUI in an interactive terminal to avoid /dev/tty errors
+  - Cold npx cache can extend startup; use env override as needed

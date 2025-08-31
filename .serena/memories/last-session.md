@@ -1,1 +1,9 @@
-Completed implementation for spec 'tui-preflight-ux' on branch 'tui'. Tasks 1–15 delivered: preflight aggregation with status/errs, TUI status badges and details, safe abort semantics, unified navigation, description editor + diff improvements, launch picker persistence, styled Results summary with copy block, help overlay and no-color fallback, panic hardening, and docs (MANUAL_TESTS.md, INSPIRATION.md). Build passes (go build ./...). To verify: run with --tui across sample configs; check Results and cancel semantics; confirm API key masking in summary and full key in copy block; NO_COLOR env triggers fallback. Next: optional UI polish and unit tests for TUI reducers and trim300.
+# Last Session Summary
+
+- Fixed build error by adding a local `mapsClone` helper used to duplicate JSON-RPC envelopes before setting `id`.
+- Removed mixed framing; reverted MCP client handshake to newline-delimited JSON only. Single `initialize(id:1)`; send only `notifications/initialized`.
+- Implemented fast–slow initialize wait: 6s fast window; on timeout only, a single fallback window controlled by `MCP_INIT_TIMEOUT_SEC` (default 20s). This addresses cold `npx` and dashboard-startup delays without server-specific tweaks.
+- Updated `AGENTS.md`:
+  - Removed repomix troubleshooting section.
+  - Added “Startup and Timeout Policy (MCP)” and enhanced guardrails in the incident report to prevent regressions.
+- Verified spec-workflow newline handshake works; noted TUI requires a TTY. Repomix issues traced to `npx` cache/environment, not client framing.
