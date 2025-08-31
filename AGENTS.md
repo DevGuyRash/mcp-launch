@@ -90,6 +90,15 @@ This section documents a regression that caused all MCP servers to fail during p
   - When modifying response loops, ensure the loop exits on the matched `id` (labeled break or equivalent). Add focused tests/logs when touching this area.
   - Use the fast–slow init strategy and `MCP_INIT_TIMEOUT_SEC` override rather than increasing global timeouts blindly. Never switch framing modes as a fallback within the same connection.
 
+## 6. TUI UX Improvements (Spec: tui-diff-and-descriptions-ux-improvements)
+
+- Description tags: Edited, Trimmed, Truncated, Over Limit (+N), Orig N, Mod M. Stable order and ASCII fallbacks (e.g., [Edited]).
+- Help overlay: Press `?` for grouped keys (navigation, actions, view toggles, editor modes). Numeric shortcuts removed from server options.
+- Diff view: Unified and side-by-side with a stable vertical separator. Wrap toggle (`w`) defaults On; horizontal scroll via arrows when Off.
+- Resize fallback: Side-by-side automatically falls back to Unified when width is below `2×MinCol + separator + gutters`.
+- NO_COLOR: When `NO_COLOR` is set, UI renders readable ASCII markers and avoids color usage.
+
+
 ## 5. Startup and Timeout Policy (MCP)
 
 This project must work with many different MCP servers without server-specific customization. Startup time varies by environment (e.g., cold `npx` caches, parallel launches, servers that also spin up dashboards). To stay robust and generic:
