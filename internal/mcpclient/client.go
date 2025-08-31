@@ -9,6 +9,7 @@ import (
     "io"
     "os"
     "os/exec"
+    "strconv"
     "strings"
     "time"
 
@@ -169,33 +170,66 @@ func inspectStdio(ctx context.Context, name string, s cfg.MCPServer) (Summary, e
     initReq["id"] = 1
     _ = sendLine(initReq)
 
-    // wait for id=1 only (known-good behavior, 6s timeout)
-    ctxR, cancel := context.WithTimeout(ctx, 6*time.Second)
-    defer cancel()
+    // wait for id=1 only with fast-slow strategy.
+    // Fast window: 6s. If timeout, extend once using MCP_INIT_TIMEOUT_SEC (default 20s).
     var sawInit bool
-    for !sawInit {
-        line, err := readJSON(ctxR, rd)
-        if err != nil {
-            _ = cmd.Process.Kill()
-            return Summary{ServerName: name}, fmt.Errorf("init read: %w", err)
-        }
-        var r resp
-        if json.Unmarshal([]byte(line), &r) == nil && r.ID != nil {
-            switch r.ID.(type) {
-            case float64:
-                if int(r.ID.(float64)) == 1 {
-                    if r.Error != nil {
-                        _ = cmd.Process.Kill()
-                        return Summary{ServerName: name}, fmt.Errorf("initialize failed: %s", r.Error.Message)
-                    }
-                    sawInit = true
+    waitOnce := func(timeout time.Duration) (bool, error) {
+        ctxR, cancel := context.WithTimeout(ctx, timeout)
+        defer cancel()
+        for {
+            line, err := readJSON(ctxR, rd)
+            if err != nil {
+                // Propagate timeout to allow slow fallback; other errors are fatal.
+                if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+                    return false, err
                 }
-            case int:
-                if r.ID.(int) == 1 {
-                    sawInit = true
+                return false, err
+            }
+            var r resp
+            if json.Unmarshal([]byte(line), &r) == nil && r.ID != nil {
+                switch r.ID.(type) {
+                case float64:
+                    if int(r.ID.(float64)) == 1 {
+                        if r.Error != nil {
+                            return false, fmt.Errorf("initialize failed: %s", r.Error.Message)
+                        }
+                        return true, nil
+                    }
+                case int:
+                    if r.ID.(int) == 1 {
+                        return true, nil
+                    }
                 }
             }
         }
+    }
+    // Fast attempt
+    if ok, err := waitOnce(6 * time.Second); err == nil && ok {
+        sawInit = true
+    } else if err != nil && (errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)) {
+        // Slow fallback attempt
+        slowSec := 20
+        if v := strings.TrimSpace(os.Getenv("MCP_INIT_TIMEOUT_SEC")); v != "" {
+            if n, e := strconv.Atoi(v); e == nil && n > 0 {
+                slowSec = n
+            }
+        }
+        if ok2, err2 := waitOnce(time.Duration(slowSec) * time.Second); err2 == nil && ok2 {
+            sawInit = true
+        } else if err2 != nil {
+            _ = cmd.Process.Kill()
+            if errors.Is(err2, context.DeadlineExceeded) || errors.Is(err2, context.Canceled) {
+                return Summary{ServerName: name}, fmt.Errorf("init read: %w", err2)
+            }
+            return Summary{ServerName: name}, fmt.Errorf("init read: %v", err2)
+        }
+    } else if err != nil {
+        _ = cmd.Process.Kill()
+        return Summary{ServerName: name}, fmt.Errorf("init read: %v", err)
+    }
+    if !sawInit {
+        _ = cmd.Process.Kill()
+        return Summary{ServerName: name}, fmt.Errorf("init read: %v", context.DeadlineExceeded)
     }
     // 2) initialized notification (MCP v2025 style)
     notify := map[string]any{
