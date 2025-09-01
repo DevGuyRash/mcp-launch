@@ -92,7 +92,7 @@ func renderUnifiedDiff(before, after string, wrap bool) string {
 
 // renderSideBySideDiff renders a very simple side-by-side view.
 // width is the max width of each column (best-effort).
-func renderSideBySideDiff(before, after string, width int, wrap bool) string {
+func renderSideBySideDiff(before, after string, width int, wrap bool, leftStart, rightStart int) string {
 	bLines := strings.Split(before, "\n")
 	aLines := strings.Split(after, "\n")
 	max := len(bLines)
@@ -112,21 +112,21 @@ func renderSideBySideDiff(before, after string, width int, wrap bool) string {
 		tagStyle.Render("OVERRIDE"),
 	)
 	sb.WriteString(header + "\n")
-	for i := 0; i < max; i++ {
-		var bl, al string
-		if i < len(bLines) {
-			bl = bLines[i]
-		}
-		if i < len(aLines) {
-			al = aLines[i]
-		}
-		// produce display lines respecting wrap
-		leftLines := []string{bl}
-		rightLines := []string{al}
-		if wrap {
-			leftLines = softWrap(bl, width-2)
-			rightLines = softWrap(al, width-2)
-		}
+    for i := 0; i < max; i++ {
+        var bl, al string
+        if i < len(bLines) {
+            bl = bLines[i]
+        }
+        if i < len(aLines) {
+            al = aLines[i]
+        }
+        // produce display lines respecting wrap
+        leftLines := []string{bl}
+        rightLines := []string{al}
+        if wrap {
+            leftLines = softWrap(bl, width-2)
+            rightLines = softWrap(al, width-2)
+        }
 		// expand to same number of visual lines
 		rows := len(leftLines)
 		if len(rightLines) > rows {
@@ -141,12 +141,12 @@ func renderSideBySideDiff(before, after string, width int, wrap bool) string {
 			if r < len(rightLines) {
 				rl = rightLines[r]
 			}
-			if !wrap && bl != al && r == 0 {
-				// char-level highlight only on first visual row when not wrapping
-				d := dmp.New()
-				diffs := d.DiffMain(bl, al, false)
-				d.DiffCleanupSemantic(diffs)
-				var lbuf, rbuf strings.Builder
+            if !wrap && bl != al && r == 0 {
+                // char-level highlight only on first visual row when not wrapping
+                d := dmp.New()
+                diffs := d.DiffMain(bl, al, false)
+                d.DiffCleanupSemantic(diffs)
+                var lbuf, rbuf strings.Builder
 				for _, df := range diffs {
 					switch df.Type {
 					case dmp.DiffDelete:
@@ -158,18 +158,42 @@ func renderSideBySideDiff(before, after string, width int, wrap bool) string {
 						rbuf.WriteString(diffAddLine.Render(df.Text))
 					}
 				}
-				ll = lbuf.String()
-				rl = rbuf.String()
-			} else if bl == al {
-				ll = faint.Render(ll)
-				rl = faint.Render(rl)
-			}
-			left := pad(ll, width)
-			right := rl
-			sb.WriteString(left + "  |  " + right + "\n")
-		}
-	}
-	return sb.String()
+                ll = lbuf.String()
+                rl = rbuf.String()
+                // apply horizontal clipping when not wrapping
+                if leftStart > 0 {
+                    rr := []rune(ll)
+                    if leftStart < len(rr) {
+                        ll = string(rr[leftStart:])
+                    } else { ll = "" }
+                }
+                if rightStart > 0 {
+                    rr := []rune(rl)
+                    if rightStart < len(rr) {
+                        rl = string(rr[rightStart:])
+                    } else { rl = "" }
+                }
+            } else if bl == al {
+                ll = faint.Render(ll)
+                rl = faint.Render(rl)
+            }
+            // apply clipping for non-first visual lines when not wrapping
+            if !wrap && r > 0 {
+                if leftStart > 0 {
+                    rr := []rune(ll)
+                    if leftStart < len(rr) { ll = string(rr[leftStart:]) } else { ll = "" }
+                }
+                if rightStart > 0 {
+                    rr := []rune(rl)
+                    if rightStart < len(rr) { rl = string(rr[rightStart:]) } else { rl = "" }
+                }
+            }
+            left := pad(ll, width)
+            right := rl
+            sb.WriteString(left + "  |  " + right + "\n")
+        }
+    }
+    return sb.String()
 }
 
 // softWrap breaks a string into lines of at most width columns, attempting to wrap at spaces.

@@ -26,12 +26,15 @@ func (StatusBar) View(s state.UIState) string {
         view = "Side-by-side"
     }
     pos := fmt.Sprintf("H:%d|%d V:%d", s.ScrollHLeft, s.ScrollHRight, s.ScrollV)
+    sync := "Sync:Off"
+    if s.SyncScroll {
+        sync = "Sync:On"
+    }
     width := fmt.Sprintf("W:%d", s.Width)
 
-    parts := []string{mode, wrap, view, pos, width}
+    parts := []string{mode, wrap, view, pos, sync, width}
     if s.Notice != "" {
         parts = append(parts, s.Notice)
     }
     return strings.Join(parts, "  ")
 }
-

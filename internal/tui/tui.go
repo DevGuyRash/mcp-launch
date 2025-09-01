@@ -111,9 +111,14 @@ type model struct {
 	statusMsg  string
 	showHelp   bool
 
-	// diff / view options
-	diffUnified bool // true=unified, false=side-by-side
-	wrapLines   bool // soft wrap long lines in viewers
+    // diff / view options
+    diffUnified bool // true=unified, false=side-by-side
+    wrapLines   bool // soft wrap long lines in viewers
+    // diff scrolling & sync
+    scrollHLeft  int
+    scrollHRight int
+    scrollV      int
+    syncScroll   bool
 
 	controller string // "mcpo" or "raw"
 	termWidth  int
@@ -226,11 +231,11 @@ case tea.WindowSizeMsg:
         }
     }
     return m, nil
-	case tea.KeyMsg:
-		rawKey := msg.String()
-		k := strings.ToLower(rawKey)
-		// If help overlay is showing, only handle closing it
-		if m.showHelp {
+    case tea.KeyMsg:
+        rawKey := msg.String()
+        k := strings.ToLower(rawKey)
+        // If help overlay is showing, only handle closing it
+        if m.showHelp {
 			switch k {
 			case "?", "esc", "b":
 				m.showHelp = false
@@ -719,19 +724,30 @@ case tea.WindowSizeMsg:
 				return m, nil
 			}
 			return m, nil
-		case modeDiff:
-			switch k {
-			case "b", "esc", "enter", "q", "ctrl+c", "d":
-				// always return to desc view
-				m.mode = modeDesc
-				return m, nil
-			case "?":
-				m.showHelp = !m.showHelp
-				return m, nil
-			case "w":
-				m.wrapLines = !m.wrapLines
-				return m, nil
-			case "u":
+        case modeDiff:
+            switch k {
+            case "b", "esc", "enter", "q", "ctrl+c", "d":
+                // always return to desc view
+                m.mode = modeDesc
+                return m, nil
+            case "?":
+                m.showHelp = !m.showHelp
+                return m, nil
+            case "w":
+                m.wrapLines = !m.wrapLines
+                return m, nil
+            case "x":
+                m.syncScroll = !m.syncScroll
+                return m, nil
+            case "left", "h":
+                if m.scrollHLeft > 0 { m.scrollHLeft-- }
+                if m.syncScroll { if m.scrollHRight > 0 { m.scrollHRight-- } }
+                return m, nil
+            case "right", "l":
+                m.scrollHLeft++
+                if m.syncScroll { m.scrollHRight++ }
+                return m, nil
+            case "u":
 				m.diffUnified = true
 				return m, nil
 			case "s":
@@ -946,19 +962,19 @@ func (m model) viewMenu() string {
 }
 
 func (m model) viewHelp() string {
-	var b strings.Builder
-	lim := descLimit()
-	b.WriteString(titleStyle.Render("Help — Key Bindings") + "\n\n")
-	b.WriteString("Global: q/ctrl+c quit   b/esc back   ? toggle help\n\n")
-	b.WriteString("List: ↑/k, ↓/j, enter/d details, c tunnel, g toggle controller\n")
-	b.WriteString("Menu: ↑/↓ select, enter choose (1..4 shortcuts)\n")
-	b.WriteString("Allow/Deny: ↑/k, ↓/j, space toggle, enter save\n")
-	b.WriteString(fmt.Sprintf("Desc: e edit inline, E edit in $EDITOR, +/t trim ≤%d, - clear, d diff, m multi-select\n", lim))
-	b.WriteString(fmt.Sprintf("Multi: space toggle, a all, u none, t trim ≤%d, r truncate ≤%d, - clear, b back\n", lim, lim))
-	b.WriteString("Diff: u unified, s side-by-side, w wrap, enter/b back\n")
-	b.WriteString("Launch: ↑/↓ Select tunnel (Local/Quick/Named), enter confirm\n")
-	b.WriteString("\n?: close help\n")
-	return b.String()
+    var b strings.Builder
+    lim := descLimit()
+    b.WriteString(titleStyle.Render("Help — Key Bindings") + "\n\n")
+    b.WriteString("Global: q/ctrl+c quit   b/esc back   ? toggle help\n\n")
+    b.WriteString("List: ↑/k, ↓/j, enter/d details, c tunnel, g toggle controller\n")
+    b.WriteString("Menu: ↑/↓ select, enter choose\n")
+    b.WriteString("Allow/Deny: ↑/k, ↓/j, space toggle, enter save\n")
+    b.WriteString(fmt.Sprintf("Desc: e edit inline, E edit in $EDITOR, +/t trim ≤%d, - clear, d diff, m multi-select\n", lim))
+    b.WriteString(fmt.Sprintf("Multi: space toggle, a all, u none, t trim ≤%d, r truncate ≤%d, - clear, b back\n", lim, lim))
+    b.WriteString("Diff: u unified, s side-by-side, w wrap, ←/→ or h/l scroll, x sync, enter/b back\n")
+    b.WriteString("Launch: ↑/↓ Select tunnel (Local/Quick/Named), enter confirm\n")
+    b.WriteString("\n?: close help\n")
+    return b.String()
 }
 
 func (m *model) prepareToolEditor(presetAll bool) {
@@ -1091,19 +1107,27 @@ func (m model) viewDescMulti() string {
 }
 
 func (m model) viewDescEdit() string {
-	var b strings.Builder
-	if m.overlay == nil {
-		return ""
-	}
-	modeLabel := "[CMD]"
-	if m.editInsert {
-		modeLabel = "[INSERT]"
-	}
-	b.WriteString(titleStyle.Render(fmt.Sprintf("Edit Description — %s %s", m.curServer, modeLabel)) + "\n")
-	if len(m.curTools) > 0 {
-		t := m.curTools[m.cursorTool]
-		b.WriteString(faintStyle.Render("Tool: ") + t + "\n\n")
-	}
+    var b strings.Builder
+    if m.overlay == nil {
+        return ""
+    }
+    modeLabel := "[CMD]"
+    if m.editInsert {
+        modeLabel = "[INSERT]"
+    }
+    b.WriteString(titleStyle.Render(fmt.Sprintf("Edit Description — %s %s", m.curServer, modeLabel)) + "\n")
+    if len(m.curTools) > 0 {
+        t := m.curTools[m.cursorTool]
+        raw := m.origDesc[m.curServer][t]
+        cur := m.ta.Value()
+        tags := util.ComputeTags(raw, cur, descLimit(), !strings.EqualFold(strings.TrimSpace(raw), strings.TrimSpace(cur)))
+        chipLine := chips.View(tags, util.NoColor(false))
+        b.WriteString(faintStyle.Render("Tool: ") + t)
+        if strings.TrimSpace(chipLine) != "" {
+            b.WriteString("  " + chipLine)
+        }
+        b.WriteString("\n\n")
+    }
 	b.WriteString(m.ta.View())
 	b.WriteString("\n")
 	if m.editInsert {
@@ -1134,21 +1158,29 @@ func (m model) viewDiff() string {
 		b.WriteString("u unified  s side-by-side  w wrap  enter/b back\n")
 		return b.String()
 	}
-	if m.diffUnified {
-		b.WriteString(renderUnifiedDiff(m.diffBefore, m.diffAfter, m.wrapLines))
-	} else {
-		width := m.termWidth
-		if width <= 0 {
-			width = 100
-		}
-		col := (width - 6) / 2
-		if col < 30 {
-			col = 30
-		}
-		b.WriteString(renderSideBySideDiff(m.diffBefore, m.diffAfter, col, m.wrapLines))
-	}
-	b.WriteString("\n[u] unified  [s] side-by-side  [w] wrap  [d] back  enter/b back\n")
-	return b.String()
+    if m.diffUnified {
+        b.WriteString(renderUnifiedDiff(m.diffBefore, m.diffAfter, m.wrapLines))
+    } else {
+        width := m.termWidth
+        if width <= 0 {
+            width = 100
+        }
+        col := (width - 6) / 2
+        if col < 30 {
+            col = 30
+        }
+        // when wrap is off, honor horizontal scroll offsets
+        leftStart, rightStart := 0, 0
+        if !m.wrapLines {
+            leftStart, rightStart = m.scrollHLeft, m.scrollHRight
+            if m.syncScroll {
+                if leftStart > rightStart { rightStart = leftStart } else { leftStart = rightStart }
+            }
+        }
+        b.WriteString(renderSideBySideDiff(m.diffBefore, m.diffAfter, col, m.wrapLines, leftStart, rightStart))
+    }
+    b.WriteString("\n[u] unified  [s] side-by-side  [w] wrap  [←/→ or h/l] scroll  [x] sync  [d] back  enter/b back\n")
+    return b.String()
 }
 
 func (m model) viewLaunch() string {
