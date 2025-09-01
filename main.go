@@ -561,9 +561,7 @@ func cmdUp() {
                     "--config", inst.ConfigPath,
                     "--hot-reload",
                 )
-                if runtime.GOOS != "windows" {
-                    mcpoCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-                }
+                mcpoCmd.SysProcAttr = newSysProcAttrForGroup()
                 stdout, _ := mcpoCmd.StdoutPipe()
                 stderr, _ := mcpoCmd.StderrPipe()
                 if err := mcpoCmd.Start(); err != nil {
@@ -669,9 +667,7 @@ func cmdUp() {
             "--config", inst.ConfigPath,
             "--hot-reload",
         )
-        if runtime.GOOS != "windows" {
-            mcpoCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-        }
+        mcpoCmd.SysProcAttr = newSysProcAttrForGroup()
         stdout, _ := mcpoCmd.StdoutPipe()
         stderr, _ := mcpoCmd.StderrPipe()
         if err := mcpoCmd.Start(); err != nil {
@@ -1513,36 +1509,10 @@ func startNamedTunnel(tag, name string, stream bool, logFile *os.File, logCh cha
     return cmd.Process.Pid
 }
 
-func killPID(pid int) error {
-    if pid <= 0 {
-        return nil
-    }
-    if runtime.GOOS == "windows" {
-        return exec.Command("taskkill", "/PID", fmt.Sprint(pid), "/T", "/F").Run()
-    }
-    pr, err := os.FindProcess(pid)
-    if err == nil {
-        _ = pr.Signal(syscall.SIGTERM)
-        time.Sleep(300 * time.Millisecond)
-    }
-    return nil
-}
+func killPID(pid int) error { return killPIDOS(pid) }
 
 // killProcessGroup kills a process and (on Unix) its entire process group.
-func killProcessGroup(pid int) error {
-    if pid <= 0 {
-        return nil
-    }
-    if runtime.GOOS == "windows" {
-        return exec.Command("taskkill", "/PID", fmt.Sprint(pid), "/T", "/F").Run()
-    }
-    // Send SIGTERM to process group (-pid)
-    _ = syscall.Kill(-pid, syscall.SIGTERM)
-    time.Sleep(800 * time.Millisecond)
-    // If still alive, SIGKILL the group
-    _ = syscall.Kill(-pid, syscall.SIGKILL)
-    return nil
-}
+func killProcessGroup(pid int) error { return killProcessGroupOS(pid) }
 
 func waitURL(u string, timeout time.Duration) {
     ctx, cancel := context.WithTimeout(context.Background(), timeout)
